@@ -54,7 +54,7 @@ static constexpr uint8_t kPcaMaskShutdownOutputs =
 #endif
 
 #ifndef EPD_BUS_HZ
-#define EPD_BUS_HZ 20000000UL
+#define EPD_BUS_HZ 26600000UL
 #endif
 
 #ifndef EPD_VIDEO_TOP_DUMMY_LINES

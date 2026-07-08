@@ -73,6 +73,8 @@ portMUX_TYPE g_buffer_lock = portMUX_INITIALIZER_UNLOCKED;
 uint8_t *g_buffers[2] = {nullptr, nullptr};
 uint8_t *g_state_buffer = nullptr;
 uint8_t *g_dma_buf[2] = {nullptr, nullptr};
+uint8_t *g_blank_row = nullptr;
+uint8_t g_row_active[t5s3_epd::kActiveHeight] = {0};
 
 volatile bool g_running = false;
 volatile bool g_dma_done = true;
@@ -80,6 +82,8 @@ volatile bool g_flip_req = false;
 volatile uint8_t g_front_index = 0;
 volatile uint32_t g_vsync_count = 0;
 volatile uint32_t g_submit_count = 0;
+uint16_t g_pending_dirty_start = 0;
+uint16_t g_pending_dirty_end = t5s3_epd::kActiveHeight - 1;
 
 bool dma_done_callback(
     esp_lcd_panel_io_handle_t panel_io,
@@ -105,6 +109,7 @@ void release_allocations() {
   free_buffer(g_state_buffer);
   free_buffer(g_dma_buf[0]);
   free_buffer(g_dma_buf[1]);
+  free_buffer(g_blank_row);
 }
 
 bool alloc_video_buffers() {
@@ -141,6 +146,14 @@ bool alloc_video_buffers() {
     }
     memset(g_dma_buf[i], 0x00, kDmaRowBytes);
   }
+
+  g_blank_row = static_cast<uint8_t *>(
+      heap_caps_malloc(kDmaRowBytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA));
+  if (g_blank_row == nullptr) {
+    ESP_LOGE(kTag, "failed to allocate blank row buffer");
+    return false;
+  }
+  memset(g_blank_row, 0x00, kDmaRowBytes);
 
   return true;
 }
@@ -213,6 +226,30 @@ bool wait_tps_power_good(uint32_t timeout_ms) {
       return false;
     }
     delay(1);
+  }
+}
+
+void sanitize_dirty_region(uint16_t dirty_y, uint16_t dirty_height, uint16_t &row_start, uint16_t &row_end) {
+  row_start = 0;
+  row_end = t5s3_epd::kActiveHeight - 1;
+
+  if (dirty_height == 0U) {
+    return;
+  }
+
+  row_start = dirty_y;
+  if (row_start >= t5s3_epd::kActiveHeight) {
+    row_start = t5s3_epd::kActiveHeight - 1;
+  }
+
+  const uint32_t last_row = static_cast<uint32_t>(dirty_y) + dirty_height - 1U;
+  row_end = static_cast<uint16_t>(
+      (last_row >= t5s3_epd::kActiveHeight) ? (t5s3_epd::kActiveHeight - 1U) : last_row);
+}
+
+void mark_rows_active(uint16_t row_start, uint16_t row_end) {
+  for (uint16_t row = row_start; row <= row_end; ++row) {
+    g_row_active[row] = 1U;
   }
 }
 
@@ -351,12 +388,11 @@ bool send_row(uint8_t *data, bool first_row) {
 
 // Each state byte tracks two pixels: direction bits in the LSBs and two
 // independent 2-bit pulse counters in the upper nibbles.
-void build_active_row(const uint8_t *frame, uint16_t row, uint8_t *dst) {
-  memset(dst, 0x00, kDmaRowBytes);
-
+bool build_active_row(const uint8_t *frame, uint16_t row, uint8_t *dst) {
   uint8_t *wrptr = dst + kActiveLeftPadBytes;
   const uint8_t *rdptr = frame + (static_cast<size_t>(row) * kSourceRowBytes);
   uint8_t *stptr = g_state_buffer + (static_cast<size_t>(row) * kStateRowBytes);
+  bool needs_more_drive = false;
 
   for (size_t src_byte = 0; src_byte < kSourceRowBytes; ++src_byte) {
     uint8_t incoming_pixels = *rdptr++;
@@ -376,6 +412,7 @@ void build_active_row(const uint8_t *frame, uint16_t row, uint8_t *dst) {
 
         const uint8_t counter_increment = static_cast<uint8_t>(((~state) >> 2) & 0x24U);
         state = static_cast<uint8_t>(state + counter_increment);
+        needs_more_drive = needs_more_drive || ((state & 0x90U) != 0x90U);
         *stptr++ = state;
 
         incoming_pixels <<= 2;
@@ -383,21 +420,35 @@ void build_active_row(const uint8_t *frame, uint16_t row, uint8_t *dst) {
       *wrptr++ = packed_drive;
     }
   }
+
+  g_row_active[row] = needs_more_drive ? 1U : 0U;
+  return needs_more_drive;
 }
 
-void build_scan_row(const uint8_t *frame, uint16_t scan_row, uint8_t *dst) {
+uint8_t *prepare_scan_row(
+    const uint8_t *frame,
+    uint16_t scan_row,
+    uint8_t dma_index,
+    uint32_t &processed_rows,
+    uint32_t &continuing_rows) {
   if (scan_row < EPD_VIDEO_TOP_DUMMY_LINES) {
-    memset(dst, 0x00, kDmaRowBytes);
-    return;
+    return g_blank_row;
   }
 
   const uint16_t active_row = static_cast<uint16_t>(scan_row - EPD_VIDEO_TOP_DUMMY_LINES);
-  if (active_row < t5s3_epd::kActiveHeight) {
-    build_active_row(frame, active_row, dst);
-    return;
+  if (active_row >= t5s3_epd::kActiveHeight) {
+    return g_blank_row;
   }
 
-  memset(dst, 0x00, kDmaRowBytes);
+  if (g_row_active[active_row] == 0U) {
+    return g_blank_row;
+  }
+
+  ++processed_rows;
+  if (build_active_row(frame, active_row, g_dma_buf[dma_index])) {
+    ++continuing_rows;
+  }
+  return g_dma_buf[dma_index];
 }
 
 void sleep_to_target_frame(int64_t frame_start_us) {
@@ -444,6 +495,9 @@ void scan_task(void *unused) {
     TaskHandle_t waiter_to_notify = nullptr;
     uint8_t front_index = 0;
     uint32_t submitted_frames = 0;
+    uint16_t dirty_start = 0;
+    uint16_t dirty_end = 0;
+    bool applied_flip = false;
 
     portENTER_CRITICAL(&g_buffer_lock);
     ++g_vsync_count;
@@ -451,6 +505,9 @@ void scan_task(void *unused) {
       g_front_index ^= 1U;
       g_flip_req = false;
       ++g_submit_count;
+      dirty_start = g_pending_dirty_start;
+      dirty_end = g_pending_dirty_end;
+      applied_flip = true;
       waiter_to_notify = g_flip_waiter;
       g_flip_waiter = nullptr;
     }
@@ -459,37 +516,42 @@ void scan_task(void *unused) {
     portEXIT_CRITICAL(&g_buffer_lock);
 
     if (waiter_to_notify != nullptr) {
+      mark_rows_active(dirty_start, dirty_end);
       xTaskNotifyGive(waiter_to_notify);
     }
 
     const uint8_t *frame = g_buffers[front_index];
+    uint32_t processed_rows = 0;
+    uint32_t continuing_rows = 0;
 
     row_control_start();
 
     uint8_t dma_index = 0;
-    build_scan_row(frame, 0, g_dma_buf[dma_index]);
-    if (!send_row(g_dma_buf[dma_index], true)) {
+    uint8_t *row_ptr = prepare_scan_row(frame, 0, dma_index, processed_rows, continuing_rows);
+    bool row_uses_dma = (row_ptr != g_blank_row);
+    if (!send_row(row_ptr, true)) {
       g_running = false;
       break;
     }
 
     for (uint16_t scan_row = 1; scan_row < total_scan_rows; ++scan_row) {
-      const uint8_t next_dma_index = dma_index ^ 1U;
-      build_scan_row(frame, scan_row, g_dma_buf[next_dma_index]);
-      if (!send_row(g_dma_buf[next_dma_index], false)) {
+      const uint8_t next_dma_index = row_uses_dma ? static_cast<uint8_t>(dma_index ^ 1U) : dma_index;
+      uint8_t *next_row_ptr =
+          prepare_scan_row(frame, scan_row, next_dma_index, processed_rows, continuing_rows);
+      const bool next_row_uses_dma = (next_row_ptr != g_blank_row);
+      if (!send_row(next_row_ptr, false)) {
         g_running = false;
         break;
       }
       dma_index = next_dma_index;
+      row_uses_dma = next_row_uses_dma;
     }
 
     if (!g_running) {
       break;
     }
 
-    const uint8_t extra_dma_index = dma_index ^ 1U;
-    memset(g_dma_buf[extra_dma_index], 0x00, kDmaRowBytes);
-    if (!send_row(g_dma_buf[extra_dma_index], false)) {
+    if (!send_row(g_blank_row, false)) {
       g_running = false;
       break;
     }
@@ -504,10 +566,13 @@ void scan_task(void *unused) {
           (log_frames == 0U) ? 0U : static_cast<uint32_t>((log_scan_us / log_frames) / 1000ULL);
       ESP_LOGI(
           kTag,
-          "scan=%u fps submitted=%u fps avg_scan=%u ms vsync=%lu",
+          "scan=%u fps submitted=%u fps avg_scan=%u ms drive_rows=%lu keep_rows=%lu flip=%s vsync=%lu",
           log_frames,
           submitted_frames - last_submit_count,
           avg_scan_ms,
+          static_cast<unsigned long>(processed_rows),
+          static_cast<unsigned long>(continuing_rows),
+          applied_flip ? "yes" : "no",
           static_cast<unsigned long>(g_vsync_count));
       last_submit_count = submitted_frames;
       log_frames = 0;
@@ -583,6 +648,8 @@ bool epd_video_power_on() {
   memset(g_state_buffer, 0x00, kStateBufferBytes);
   memset(g_dma_buf[0], 0x00, kDmaRowBytes);
   memset(g_dma_buf[1], 0x00, kDmaRowBytes);
+  memset(g_blank_row, 0x00, kDmaRowBytes);
+  memset(g_row_active, 0x00, sizeof(g_row_active));
   configure_idle_levels();
 
   bool after_power_good = false;
@@ -605,10 +672,13 @@ bool epd_video_start() {
   g_submit_count = 0;
   g_flip_req = false;
   g_flip_waiter = nullptr;
+  g_pending_dirty_start = 0;
+  g_pending_dirty_end = t5s3_epd::kActiveHeight - 1;
   portEXIT_CRITICAL(&g_buffer_lock);
 
   g_dma_done = true;
   g_running = true;
+  memset(g_row_active, 0x00, sizeof(g_row_active));
 
   const BaseType_t rc = xTaskCreatePinnedToCore(
       scan_task,
@@ -639,17 +709,19 @@ size_t epd_video_get_backbuffer_size() {
 }
 
 void epd_video_flip(uint16_t dirty_y, uint16_t dirty_height) {
-  (void)dirty_y;
-  (void)dirty_height;
-
   if (!g_running) {
     return;
   }
 
   TaskHandle_t self = xTaskGetCurrentTaskHandle();
   (void)ulTaskNotifyTake(pdTRUE, 0);
+  uint16_t row_start = 0;
+  uint16_t row_end = 0;
+  sanitize_dirty_region(dirty_y, dirty_height, row_start, row_end);
 
   portENTER_CRITICAL(&g_buffer_lock);
+  g_pending_dirty_start = row_start;
+  g_pending_dirty_end = row_end;
   g_flip_waiter = self;
   g_flip_req = true;
   portEXIT_CRITICAL(&g_buffer_lock);
