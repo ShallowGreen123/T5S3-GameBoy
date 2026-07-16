@@ -213,6 +213,7 @@ void paperboy_ui_draw_static(uint8_t *framebuffer) {
   mono_draw_text(framebuffer, kPitch, kWidth, kHeight, 428, 696, "A", 2, false);
   mono_draw_text(framebuffer, kPitch, kWidth, kHeight, 169, 882, "SELECT", 1, false);
   mono_draw_text(framebuffer, kPitch, kWidth, kHeight, 304, 882, "START", 1, false);
+  mono_draw_frame(framebuffer, kPitch, kWidth, kHeight, 24, 910, 492, 32, 2, false);
 }
 
 void paperboy_ui_draw_dynamic(
@@ -237,9 +238,8 @@ void paperboy_ui_draw_dynamic(
   draw_button_box(framebuffer, kSelectRect, "", (buttons & GBEMU_INPUT_SELECT) != 0U);
   draw_button_box(framebuffer, kStartRect, "", (buttons & GBEMU_INPUT_START) != 0U);
 
-  mono_fill_rect(framebuffer, kPitch, kWidth, kHeight, 24, 910, 492, 32, true);
+  mono_fill_rect(framebuffer, kPitch, kWidth, kHeight, 26, 912, 488, 28, true);
   if (status_text != nullptr && status_text[0] != '\0') {
-    mono_draw_frame(framebuffer, kPitch, kWidth, kHeight, 24, 910, 492, 32, 2, false);
     mono_draw_text(framebuffer, kPitch, kWidth, kHeight, 38, 920, status_text, 1, false);
   }
 }

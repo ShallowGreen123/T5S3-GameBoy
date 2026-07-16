@@ -34,11 +34,18 @@ pio device monitor -b 115200
 仅使用你有权运行和分发的 `.gb` 文件。仓库不会附带商业游戏 ROM。
 
 ```powershell
-python tools/gb_rom_to_header.py path/to/homebrew.gb examples/epd_paperboy/main/rom/test_rom.h
-pio run -d examples/epd_paperboy
+python tools/gb_rom_to_header.py "D:\ROMs\game.gb"
+pio run -t clean
+pio run -t upload
 ```
 
-`rom/test_rom.h` 存在时会替代内置测试 ROM。删除该文件即可恢复测试 ROM。
+脚本默认生成 `examples/epd_paperboy/main/rom/test_rom.h`。该文件存在时会替代
+内置演示 ROM；烧录完成后设备会直接启动该游戏。删除该文件、重新编译并烧录即可恢复
+内置演示 ROM。
+
+当前适合运行原版 Game Boy（DMG）兼容的 `.gb` ROM，不支持仅限 Game Boy Color 的
+游戏，也暂未输出声音。MBC 等卡带特性的兼容性取决于 Peanut-GB；如果 ROM 不受支持，
+屏幕和串口会显示 ROM 初始化错误。请只使用你合法拥有或获准使用的 ROM。
 
 ## 控制
 
@@ -52,5 +59,5 @@ pio run -d examples/epd_paperboy
 | SELECT / START | Game Boy SELECT / START |
 
 串口每秒输出模拟帧、渲染帧、跳帧、VSYNC 丢失数、各阶段耗时和剩余内存。
-GT911 还会每秒输出 `status`、`INT` 电平、轮询数和读取错误数；任意有效触点
-都会在屏幕底部显示 `TOUCH x,y`，用于确认触摸方向和命中位置。
+GT911 还会每秒输出 `status`、`INT` 电平、轮询数和读取错误数；每次按下的触点坐标
+保留在串口日志中，避免屏幕底部反复重绘造成额外残影。

@@ -5,7 +5,7 @@ import sys
 from pathlib import Path
 
 
-DEFAULT_OUTPUT = Path("examples/epd_gb_frame_probe/main/rom/test_rom.h")
+DEFAULT_OUTPUT = Path("examples/epd_paperboy/main/rom/test_rom.h")
 BYTES_PER_LINE = 12
 
 

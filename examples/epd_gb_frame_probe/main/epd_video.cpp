@@ -34,7 +34,10 @@ constexpr uint8_t kResetCounterMask[4] = {0xFC, 0xE0, 0x1C, 0x00};
 constexpr uint8_t kTpsRegEnable = 0x01;
 constexpr uint8_t kTpsRegVcom = 0x03;
 constexpr uint8_t kTpsRegPowerGood = 0x0F;
-constexpr gpio_num_t kDummyDcGpio = GPIO_NUM_35;
+// Use GPIO0 as the required dummy D/C line to match the known-good FastEPD
+// raw-panel setup for this board family. Reusing GPIO35 here can destabilize
+// PSRAM-backed allocations on ESP32-S3 modules after the LCD bus is attached.
+constexpr gpio_num_t kDummyDcGpio = GPIO_NUM_0;
 constexpr gpio_num_t kWrGpio = GPIO_NUM_4;
 constexpr gpio_num_t kCsGpio = GPIO_NUM_41;
 constexpr gpio_num_t kLeGpio = GPIO_NUM_42;
@@ -267,7 +270,6 @@ bool init_control_gpios() {
   config.pull_down_en = GPIO_PULLDOWN_DISABLE;
   config.intr_type = GPIO_INTR_DISABLE;
   config.pin_bit_mask =
-      (1ULL << kDummyDcGpio) |
       (1ULL << kCsGpio) |
       (1ULL << kLeGpio) |
       (1ULL << kStvGpio) |

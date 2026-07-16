@@ -27,15 +27,15 @@
 namespace {
 
 constexpr const char *kTag = "paperboy";
-constexpr const char *kFirmwareVersion = "portrait-v3";
+constexpr const char *kFirmwareVersion = "portrait-v4";
 constexpr uint8_t kMaxConsecutiveSkippedFrames = 2;
 constexpr uint16_t kPanelPitch = t5s3_epd::kActiveWidth / 8U;
 constexpr size_t kScreenBytes =
     static_cast<size_t>(kPanelPitch) * t5s3_epd::kActiveHeight;
 constexpr size_t kPortraitBytes =
     static_cast<size_t>(PAPERBOY_LOGICAL_PITCH) * PAPERBOY_LOGICAL_HEIGHT;
-constexpr uint16_t kDynamicDirtyY = 23;
-constexpr uint16_t kDynamicDirtyHeight = 493;
+constexpr uint16_t kDynamicDirtyY = 20;
+constexpr uint16_t kDynamicDirtyHeight = 500;
 constexpr uint8_t kClearWhiteFrames = 5;
 constexpr uint8_t kClearBlackFrames = 7;
 
@@ -182,7 +182,9 @@ void rotate_portrait_to_panel(const uint8_t *portrait, uint8_t *panel) {
           packed |= static_cast<uint8_t>(0x80U >> bit);
         }
       }
-      dest[byte_x] = packed;
+      // The raw panel data polarity is the inverse of the logical canvas:
+      // zero drives paper white and one drives paper black.
+      dest[byte_x] = static_cast<uint8_t>(~packed);
     }
   }
 }
@@ -291,7 +293,9 @@ void submit_clear_frame(bool white, uint8_t hold_frames) {
   if (backbuffer == nullptr) {
     return;
   }
-  mono_clear(backbuffer, kScreenBytes, white);
+  // This buffer goes directly to the panel and does not pass through the
+  // portrait conversion, so apply the physical panel polarity here too.
+  memset(backbuffer, white ? 0x00 : 0xFF, kScreenBytes);
   epd_video_flip(0, t5s3_epd::kActiveHeight);
   wait_vsync_frames(hold_frames);
 }
@@ -339,6 +343,7 @@ void run_console(void *unused) {
 
   bool power_on = true;
   uint8_t last_buttons = 0;
+  bool last_touch_down = false;
   uint8_t consecutive_skips = 0;
   uint32_t last_vsync = epd_video_get_vsync_count();
   uint64_t stats_started = esp_timer_get_time();
@@ -364,18 +369,16 @@ void run_console(void *unused) {
 
     const uint8_t buttons = touch_ok ? paperboy_ui_map_buttons(&touch) : 0U;
     const uint32_t actions = touch_ok ? paperboy_ui_map_actions(&touch) : 0U;
-    bool force_full_redraw = buttons != last_buttons;
+    bool force_render = buttons != last_buttons;
 
-    if (touch_ok && touch.touched && touch.points > 0U) {
-      char feedback[32];
-      snprintf(
-          feedback,
-          sizeof(feedback),
-          "TOUCH %u,%u",
-          (unsigned)touch.x[0],
-          (unsigned)touch.y[0]);
-      set_status(feedback, 300U);
-      force_full_redraw = true;
+    const bool touch_down = touch_ok && touch.touched && touch.points > 0U;
+    if (touch_down && !last_touch_down) {
+      ESP_LOGI(
+          kTag,
+          "touch down points=%u first=%u,%u",
+          touch.points,
+          touch.x[0],
+          touch.y[0]);
     }
 
     if (buttons != last_buttons) {
@@ -391,7 +394,7 @@ void run_console(void *unused) {
     if ((actions & PAPERBOY_ACTION_POWER) != 0U) {
       power_on = !power_on;
       set_status(power_on ? "POWER ON" : "SOFT POWER OFF");
-      force_full_redraw = true;
+      force_render = true;
       ESP_LOGI(kTag, "soft power=%s", power_on ? "on" : "off");
     }
 
@@ -405,7 +408,7 @@ void run_console(void *unused) {
         set_status("SAVE UNAVAILABLE");
         ESP_LOGW(kTag, "quick save unavailable");
       }
-      force_full_redraw = true;
+      force_render = true;
     }
 
     if ((actions & PAPERBOY_ACTION_LOAD) != 0U) {
@@ -418,14 +421,14 @@ void run_console(void *unused) {
         set_status("NO SAVED STATE");
         ESP_LOGW(kTag, "quick load requested without a state");
       }
-      force_full_redraw = true;
+      force_render = true;
     }
 
     if (power_on) {
       const uint32_t vsync_now = epd_video_get_vsync_count();
       const uint32_t vsync_gap = vsync_now - last_vsync;
       const bool skip_render =
-          !force_full_redraw && vsync_gap > 0U &&
+          !force_render && vsync_gap > 0U &&
           consecutive_skips < kMaxConsecutiveSkippedFrames;
       gbemu_frame_stats_t frame_stats = {};
 
@@ -458,24 +461,23 @@ void run_console(void *unused) {
         compose_scene(backbuffer, buttons, power_on);
         add_sample(draw_timing, frame_stats.draw_us);
         const int64_t flip_started = esp_timer_get_time();
-        epd_video_flip(
-            force_full_redraw ? 0U : kDynamicDirtyY,
-            force_full_redraw ? t5s3_epd::kActiveHeight : kDynamicDirtyHeight);
+        epd_video_flip(kDynamicDirtyY, kDynamicDirtyHeight);
         add_sample(flip_timing, static_cast<uint32_t>(esp_timer_get_time() - flip_started));
         ++rendered_frames;
         consecutive_skips = 0;
         last_vsync = epd_video_get_vsync_count();
       }
-    } else if (force_full_redraw) {
+    } else if (force_render) {
       uint8_t *backbuffer = epd_video_get_backbuffer();
       compose_scene(backbuffer, buttons, power_on);
-      epd_video_flip(0, t5s3_epd::kActiveHeight);
+      epd_video_flip(kDynamicDirtyY, kDynamicDirtyHeight);
       last_vsync = epd_video_get_vsync_count();
     } else {
       vTaskDelay(pdMS_TO_TICKS(5));
     }
 
     last_buttons = buttons;
+    last_touch_down = touch_down;
     const uint64_t now = esp_timer_get_time();
     if ((now - stats_started) >= 1000000ULL) {
       ESP_LOGI(
