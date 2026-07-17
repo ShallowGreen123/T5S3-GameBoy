@@ -11,7 +11,7 @@ namespace {
 constexpr uint16_t kWidth = PAPERBOY_LOGICAL_WIDTH;
 constexpr uint16_t kHeight = PAPERBOY_LOGICAL_HEIGHT;
 constexpr uint16_t kPitch = PAPERBOY_LOGICAL_PITCH;
-constexpr uint32_t kActionDebounceMs = 300U;
+constexpr uint32_t kActionDebounceMs = 120U;
 
 struct Rect {
   int x;
@@ -25,7 +25,10 @@ constexpr Rect kSaveRect = {316, 20, 94, 42};
 constexpr Rect kLoadRect = {420, 20, 100, 42};
 constexpr Rect kSelectRect = {160, 842, 92, 30};
 constexpr Rect kStartRect = {288, 842, 92, 30};
-constexpr Rect kSettingsRect = {376, 902, 140, 42};
+constexpr Rect kSettingsButtonRect = {370, 902, 150, 42};
+// Use a much larger hit target than the visible frame. The old 140x42 target
+// was too close to the lower edge for reliable finger taps on the GT911.
+constexpr Rect kSettingsTouchRect = {320, 876, 220, 80};
 
 constexpr Rect kBackRect = {20, 20, 112, 44};
 constexpr Rect kHomeRect = {408, 20, 112, 44};
@@ -85,7 +88,7 @@ uint32_t current_action_mask(const touch_state_t *touch, PaperboyPage page) {
       if (point_in_rect(x, y, kLoadRect)) {
         mask |= PAPERBOY_ACTION_LOAD;
       }
-      if (point_in_rect(x, y, kSettingsRect)) {
+      if (point_in_rect(x, y, kSettingsTouchRect)) {
         mask |= PAPERBOY_ACTION_SETTINGS;
       }
       continue;
@@ -457,7 +460,7 @@ void paperboy_ui_draw_dynamic(
   draw_round_button(framebuffer, kButtonBX, kButtonBY, (buttons & GBEMU_INPUT_B) != 0U);
   draw_button_box(framebuffer, kSelectRect, "", (buttons & GBEMU_INPUT_SELECT) != 0U);
   draw_button_box(framebuffer, kStartRect, "", (buttons & GBEMU_INPUT_START) != 0U);
-  draw_button_box(framebuffer, kSettingsRect, "SETTING", false);
+  draw_button_box(framebuffer, kSettingsButtonRect, "SETTING", false);
 }
 
 void paperboy_ui_draw_page(

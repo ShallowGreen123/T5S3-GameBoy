@@ -18,6 +18,9 @@ static constexpr uint8_t kI2cSda = 39;
 static constexpr uint8_t kI2cScl = 40;
 static constexpr uint8_t kTouchInt = 3;
 static constexpr uint8_t kTouchRst = 9;
+static constexpr uint8_t kBootButton = 0;
+static constexpr uint8_t kPca9535Int = 38;
+static constexpr uint8_t kLoraCs = 46;
 
 static constexpr uint8_t kPca9535Address = 0x20;
 static constexpr uint8_t kTps65185Address = 0x68;
