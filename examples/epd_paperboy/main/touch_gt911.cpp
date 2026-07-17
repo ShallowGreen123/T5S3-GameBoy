@@ -16,6 +16,7 @@ constexpr uint16_t kRegProductId = 0x8140;
 constexpr uint16_t kRegStatus = 0x814E;
 constexpr uint16_t kRegFirstPoint = 0x814F;
 constexpr uint8_t kReadyMask = 0x80;
+constexpr uint8_t kHomeKeyMask = 0x10;
 constexpr uint8_t kTouchCountMask = 0x0F;
 constexpr uint32_t kI2cTimeoutMs = 20;
 constexpr uint16_t kFallbackRawWidth = 540;
@@ -246,6 +247,8 @@ bool touch_read(touch_state_t *out_state) {
   g_last_status = status;
 
   const uint8_t point_count = (uint8_t)(status & kTouchCountMask);
+  out_state->home_pressed =
+      (status & kReadyMask) != 0U && (status & kHomeKeyMask) != 0U;
   if (point_count == 0U) {
     if ((status & kReadyMask) != 0U) {
       (void)write_reg8(kRegStatus, 0);
@@ -327,10 +330,11 @@ void touch_debug_dump_once_per_second(void) {
   } else {
     ESP_LOGI(
         kTag,
-        "polls=%lu errors=%lu status=0x%02X int=%d points=0",
+        "polls=%lu errors=%lu status=0x%02X int=%d points=0 home=%u",
         (unsigned long)g_status_polls,
         (unsigned long)g_read_errors,
         (unsigned)g_last_status,
-        digitalRead(t5s3_epd::kTouchInt));
+        digitalRead(t5s3_epd::kTouchInt),
+        g_last_state.home_pressed ? 1U : 0U);
   }
 }

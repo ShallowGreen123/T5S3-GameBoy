@@ -2,6 +2,7 @@
 #include <Wire.h>
 #include <esp_heap_caps.h>
 #include <esp_log.h>
+#include <esp_sleep.h>
 #include <esp_system.h>
 #include <esp_timer.h>
 #include <freertos/FreeRTOS.h>
@@ -9,6 +10,7 @@
 #include <string.h>
 
 #include "builtin_demo_rom.h"
+#include "battery_power.h"
 #include "epd_video.h"
 #include "gbemu.h"
 #include "mono_canvas.h"
@@ -27,7 +29,7 @@
 namespace {
 
 constexpr const char *kTag = "paperboy";
-constexpr const char *kFirmwareVersion = "video-v9";
+constexpr const char *kFirmwareVersion = "video-v10-settings";
 constexpr uint8_t kMinSkippedFramesBetweenRenders = 1;
 constexpr uint8_t kPanelBufferCount = 2;
 constexpr int64_t kGameFramePeriodUs = 16742;
@@ -43,6 +45,7 @@ constexpr uint16_t kGameDirtyY =
 constexpr uint16_t kGameDirtyHeight = GBEMU_FRAME_WIDTH;
 constexpr uint8_t kClearWhiteFrames = 5;
 constexpr uint8_t kClearBlackFrames = 7;
+constexpr uint32_t kPowerButtonHoldMs = 2000U;
 
 static_assert(GBEMU_FRAME_WIDTH == 480U, "unexpected GB frame width");
 static_assert(GBEMU_FRAME_HEIGHT == 432U, "unexpected GB frame height");
@@ -66,8 +69,6 @@ size_t g_quicksave_size = 0;
 bool g_quicksave_valid = false;
 bool g_touch_available = false;
 const char *g_idle_reason = nullptr;
-char g_status_text[32] = {0};
-uint32_t g_status_until_ms = 0;
 
 const uint8_t *rom_data() {
 #if PAPERBOY_HAS_CUSTOM_ROM
@@ -123,22 +124,6 @@ uint8_t *allocate_buffer(size_t size, bool prefer_internal) {
     }
   }
   return buffer;
-}
-
-void set_status(const char *text, uint32_t duration_ms = 1400U) {
-  snprintf(g_status_text, sizeof(g_status_text), "%s", text == nullptr ? "" : text);
-  g_status_until_ms = millis() + duration_ms;
-}
-
-const char *current_status() {
-  if (g_status_text[0] == '\0') {
-    return "";
-  }
-  if (static_cast<int32_t>(millis() - g_status_until_ms) >= 0) {
-    g_status_text[0] = '\0';
-    return "";
-  }
-  return g_status_text;
 }
 
 void blit_game_frame(uint8_t *framebuffer) {
@@ -247,20 +232,34 @@ void pace_game_frame(int64_t &next_frame_us) {
   }
 }
 
-void compose_scene(uint8_t *framebuffer, uint8_t buttons, bool power_on) {
+void compose_scene(
+    uint8_t *framebuffer,
+    uint8_t buttons,
+    bool power_on,
+    PaperboyPage page,
+    const BatteryStatus *battery) {
   if (framebuffer == nullptr || g_background == nullptr ||
       g_scene == nullptr || g_game_frame == nullptr) {
     return;
   }
 
-  memcpy(g_scene, g_background, kPortraitBytes);
-  if (power_on) {
-    blit_game_frame(g_scene);
+  if (page == PaperboyPage::Game) {
+    memcpy(g_scene, g_background, kPortraitBytes);
+    if (power_on) {
+      blit_game_frame(g_scene);
+    } else {
+      draw_power_off_screen(g_scene);
+    }
+    paperboy_ui_draw_dynamic(g_scene, buttons, power_on, g_quicksave_valid);
   } else {
-    draw_power_off_screen(g_scene);
+    paperboy_ui_draw_page(
+        g_scene,
+        page,
+        battery,
+        kFirmwareVersion,
+        g_emu == nullptr ? nullptr : gbemu_get_rom_title(g_emu),
+        g_touch_available);
   }
-  paperboy_ui_draw_dynamic(
-      g_scene, buttons, power_on, g_quicksave_valid, current_status());
   rotate_portrait_to_panel(g_scene, framebuffer);
 }
 
@@ -396,12 +395,99 @@ void on_shutdown() {
   epd_video_shutdown();
 }
 
+bool read_expander_button(bool &pressed) {
+  uint8_t input0 = 0;
+  uint8_t input1 = 0;
+  if (!g_expander.readInputs(input0, input1)) {
+    pressed = false;
+    return false;
+  }
+  (void)input0;
+  pressed = (input1 & t5s3_epd::kPcaMaskButton) == 0U;
+  return true;
+}
+
+void draw_shutdown_page() {
+  mono_clear(g_scene, kPortraitBytes, true);
+  mono_draw_frame(
+      g_scene, PAPERBOY_LOGICAL_PITCH, PAPERBOY_LOGICAL_WIDTH, PAPERBOY_LOGICAL_HEIGHT,
+      4, 4, 532, 952, 3, false);
+  mono_draw_text(
+      g_scene, PAPERBOY_LOGICAL_PITCH, PAPERBOY_LOGICAL_WIDTH, PAPERBOY_LOGICAL_HEIGHT,
+      126, 350, "POWERING OFF", 4, false);
+  mono_draw_line(
+      g_scene, PAPERBOY_LOGICAL_PITCH, PAPERBOY_LOGICAL_WIDTH, PAPERBOY_LOGICAL_HEIGHT,
+      90, 430, 450, 430, false);
+  mono_draw_text(
+      g_scene, PAPERBOY_LOGICAL_PITCH, PAPERBOY_LOGICAL_WIDTH, PAPERBOY_LOGICAL_HEIGHT,
+      150, 480, "PLEASE WAIT", 3, false);
+  mono_draw_text(
+      g_scene, PAPERBOY_LOGICAL_PITCH, PAPERBOY_LOGICAL_WIDTH, PAPERBOY_LOGICAL_HEIGHT,
+      162, 560, "HOLD PWR TO START", 2, false);
+}
+
+void present_shutdown_page() {
+  while (epd_video_submit_pending()) {
+    vTaskDelay(1);
+  }
+  draw_shutdown_page();
+  for (uint8_t copy = 0; copy < kPanelBufferCount; ++copy) {
+    while (epd_video_submit_pending()) {
+      vTaskDelay(1);
+    }
+    uint8_t *backbuffer = epd_video_get_backbuffer();
+    rotate_portrait_to_panel(g_scene, backbuffer);
+    while (!epd_video_submit(0, t5s3_epd::kActiveHeight)) {
+      vTaskDelay(1);
+    }
+  }
+  while (epd_video_submit_pending()) {
+    vTaskDelay(1);
+  }
+}
+
+[[noreturn]] void enter_power_off() {
+  ESP_LOGI(kTag, "PCA9535 button held for %lu ms; shutting down", (unsigned long)kPowerButtonHoldMs);
+  present_shutdown_page();
+  epd_video_shutdown();
+
+  const BatteryShutdownResult result = battery_request_shutdown();
+  ESP_LOGI(kTag, "BQ25896 shutdown result=%u", static_cast<unsigned>(result));
+  if (result == BatteryShutdownResult::PowerCutRequested) {
+    delay(1500);
+  }
+
+  // BATFET cannot disconnect the system while USB is supplying VBUS. Keep the
+  // screen and fall back to deep sleep, with BOOT/PWR and PCA9535 INT as wake
+  // sources. Wait for button release first to avoid an immediate wake-up.
+  bool pressed = true;
+  while (pressed) {
+    if (!read_expander_button(pressed)) {
+      break;
+    }
+    delay(20);
+  }
+  pinMode(0, INPUT_PULLUP);
+  pinMode(38, INPUT_PULLUP);
+  const uint64_t wake_mask = (1ULL << 0U) | (1ULL << 38U);
+  esp_sleep_enable_ext1_wakeup(wake_mask, ESP_EXT1_WAKEUP_ANY_LOW);
+  ESP_LOGI(kTag, "entering deep sleep fallback");
+  delay(30);
+  esp_deep_sleep_start();
+  while (true) {
+    delay(1000);
+  }
+}
+
 void run_console(void *unused) {
   (void)unused;
 
   bool power_on = true;
+  PaperboyPage page = PaperboyPage::Game;
+  BatteryStatus battery = {};
   uint8_t last_buttons = 0;
   bool last_touch_down = false;
+  uint32_t pca_button_pressed_since_ms = 0;
   uint8_t full_scene_syncs = 0;
   uint8_t skipped_since_render = 0;
   uint32_t last_vsync = epd_video_get_vsync_count();
@@ -416,9 +502,21 @@ void run_console(void *unused) {
   TimingWindow compose_timing = {};
   TimingWindow flip_timing = {};
 
-  set_status(g_touch_available ? "READY - TOUCH START" : "TOUCH NOT FOUND", 3000U);
+  const bool battery_probe_ok = battery_read_status(battery);
+  ESP_LOGI(
+      kTag,
+      "battery probe=%s gauge=%s charger=%s soc=%u voltage=%u current=%d avg=%d usb=%s",
+      battery_probe_ok ? "ok" : "failed",
+      battery.gauge_read_ok ? "online" : (battery.gauge_found ? "read-error" : "missing"),
+      battery.charger_read_ok ? "online" : (battery.charger_found ? "read-error" : "missing"),
+      battery.soc_percent,
+      battery.voltage_mv,
+      battery.current_ma,
+      battery.average_current_ma,
+      battery.usb_connected ? "yes" : "no");
+
   uint8_t *initial = epd_video_get_backbuffer();
-  compose_scene(initial, 0, power_on);
+  compose_scene(initial, 0, power_on, page, nullptr);
   epd_video_flip(0, t5s3_epd::kActiveHeight);
   memcpy(epd_video_get_backbuffer(), initial, kScreenBytes);
 
@@ -429,8 +527,9 @@ void run_console(void *unused) {
       touch_debug_dump_once_per_second();
     }
 
-    const uint8_t buttons = touch_ok ? paperboy_ui_map_buttons(&touch) : 0U;
-    const uint32_t actions = touch_ok ? paperboy_ui_map_actions(&touch) : 0U;
+    const uint8_t buttons =
+        (touch_ok && page == PaperboyPage::Game) ? paperboy_ui_map_buttons(&touch) : 0U;
+    const uint32_t actions = touch_ok ? paperboy_ui_map_actions(&touch, page) : 0U;
     if (buttons != last_buttons) {
       full_scene_syncs = kPanelBufferCount;
     }
@@ -457,7 +556,6 @@ void run_console(void *unused) {
 
     if ((actions & PAPERBOY_ACTION_POWER) != 0U) {
       power_on = !power_on;
-      set_status(power_on ? "POWER ON" : "SOFT POWER OFF");
       full_scene_syncs = kPanelBufferCount;
       ESP_LOGI(kTag, "soft power=%s", power_on ? "on" : "off");
     }
@@ -466,10 +564,8 @@ void run_console(void *unused) {
       if (g_quicksave != nullptr &&
           gbemu_save_state(g_emu, g_quicksave, g_quicksave_size)) {
         g_quicksave_valid = true;
-        set_status("STATE SAVED");
         ESP_LOGI(kTag, "quick state saved in memory");
       } else {
-        set_status("SAVE UNAVAILABLE");
         ESP_LOGW(kTag, "quick save unavailable");
       }
       full_scene_syncs = kPanelBufferCount;
@@ -479,16 +575,65 @@ void run_console(void *unused) {
       if (g_quicksave_valid && g_quicksave != nullptr &&
           gbemu_load_state(g_emu, g_quicksave, g_quicksave_size)) {
         power_on = true;
-        set_status("STATE LOADED");
         ESP_LOGI(kTag, "quick state restored");
       } else {
-        set_status("NO SAVED STATE");
         ESP_LOGW(kTag, "quick load requested without a state");
       }
       full_scene_syncs = kPanelBufferCount;
     }
 
-    if (power_on) {
+    PaperboyPage next_page = page;
+    if ((actions & PAPERBOY_ACTION_SETTINGS) != 0U && page == PaperboyPage::Game) {
+      next_page = PaperboyPage::Settings;
+    }
+    if ((actions & PAPERBOY_ACTION_BACK) != 0U) {
+      next_page = page == PaperboyPage::Settings ? PaperboyPage::Game : PaperboyPage::Settings;
+    }
+    if ((actions & PAPERBOY_ACTION_HOME) != 0U) {
+      next_page = PaperboyPage::Game;
+    }
+    if ((actions & PAPERBOY_ACTION_BATTERY) != 0U && page == PaperboyPage::Settings) {
+      next_page = PaperboyPage::Battery;
+    }
+    if ((actions & PAPERBOY_ACTION_SD_CARD) != 0U && page == PaperboyPage::Settings) {
+      next_page = PaperboyPage::SdCard;
+    }
+    if ((actions & PAPERBOY_ACTION_ABOUT) != 0U && page == PaperboyPage::Settings) {
+      next_page = PaperboyPage::About;
+    }
+    if ((actions & PAPERBOY_ACTION_REFRESH) != 0U && page == PaperboyPage::Battery) {
+      const bool ok = battery_read_status(battery);
+      ESP_LOGI(kTag, "battery refresh %s soc=%u voltage=%u", ok ? "ok" : "failed",
+               battery.soc_percent, battery.voltage_mv);
+      full_scene_syncs = kPanelBufferCount;
+    }
+    if (next_page != page) {
+      if (next_page == PaperboyPage::Battery) {
+        const bool ok = battery_read_status(battery);
+        ESP_LOGI(kTag, "battery page %s soc=%u voltage=%u", ok ? "ok" : "failed",
+                 battery.soc_percent, battery.voltage_mv);
+      }
+      ESP_LOGI(kTag, "page %u -> %u", static_cast<unsigned>(page), static_cast<unsigned>(next_page));
+      page = next_page;
+      paperboy_ui_on_page_changed();
+      full_scene_syncs = kPanelBufferCount;
+      skipped_since_render = 0;
+      next_game_frame_us = esp_timer_get_time();
+    }
+
+    bool pca_button_pressed = false;
+    const bool pca_button_ok = read_expander_button(pca_button_pressed);
+    if (page == PaperboyPage::Game && pca_button_ok && pca_button_pressed) {
+      if (pca_button_pressed_since_ms == 0U) {
+        pca_button_pressed_since_ms = millis();
+      } else if ((millis() - pca_button_pressed_since_ms) >= kPowerButtonHoldMs) {
+        enter_power_off();
+      }
+    } else {
+      pca_button_pressed_since_ms = 0U;
+    }
+
+    if (page == PaperboyPage::Game && power_on) {
       const uint32_t vsync_now = epd_video_get_vsync_count();
       const uint32_t vsync_gap = vsync_now - last_vsync;
       if (vsync_gap > 1U) {
@@ -530,7 +675,7 @@ void run_console(void *unused) {
         const int64_t compose_started = esp_timer_get_time();
         const bool full_scene = full_scene_syncs > 0U;
         if (full_scene) {
-          compose_scene(backbuffer, buttons, power_on);
+          compose_scene(backbuffer, buttons, power_on, page, nullptr);
         } else {
           rotate_game_to_panel(g_game_frame, backbuffer);
         }
@@ -557,10 +702,17 @@ void run_console(void *unused) {
         }
       }
       pace_game_frame(next_game_frame_us);
-    } else if (full_scene_syncs > 0U && !epd_video_submit_pending()) {
+    } else if (page == PaperboyPage::Game && full_scene_syncs > 0U && !epd_video_submit_pending()) {
       uint8_t *backbuffer = epd_video_get_backbuffer();
-      compose_scene(backbuffer, buttons, power_on);
+      compose_scene(backbuffer, buttons, power_on, page, nullptr);
       if (epd_video_submit(kDynamicDirtyY, kDynamicDirtyHeight)) {
+        --full_scene_syncs;
+      }
+    } else if (page != PaperboyPage::Game &&
+               full_scene_syncs > 0U && !epd_video_submit_pending()) {
+      uint8_t *backbuffer = epd_video_get_backbuffer();
+      compose_scene(backbuffer, 0, power_on, page, &battery);
+      if (epd_video_submit(0, t5s3_epd::kActiveHeight)) {
         --full_scene_syncs;
       }
     } else {
@@ -574,7 +726,8 @@ void run_console(void *unused) {
     if ((now - stats_started) >= 1000000ULL) {
       ESP_LOGI(
           kTag,
-          "power=%s emu=%lu render=%lu skip=%lu missed=%lu run(us avg/max)=%lu/%lu draw=%lu/%lu compose=%lu/%lu submit=%lu/%lu heap=%u psram=%u",
+          "page=%u power=%s emu=%lu render=%lu skip=%lu missed=%lu run(us avg/max)=%lu/%lu draw=%lu/%lu compose=%lu/%lu submit=%lu/%lu heap=%u psram=%u",
+          static_cast<unsigned>(page),
           power_on ? "on" : "off",
           (unsigned long)emulated_frames,
           (unsigned long)rendered_frames,

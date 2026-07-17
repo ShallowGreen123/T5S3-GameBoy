@@ -25,6 +25,7 @@ extern "C" {
 
 typedef struct touch_state_s {
   bool touched;
+  bool home_pressed;
   uint8_t points;
   uint16_t x[5];
   uint16_t y[5];
