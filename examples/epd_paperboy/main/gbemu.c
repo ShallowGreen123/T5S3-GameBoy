@@ -10,6 +10,10 @@
 #define PEANUT_GB_HIGH_LCD_ACCURACY 0
 #include "gbcore/peanut_gb.h"
 
+#ifndef GBEMU_FAST_MONO
+#define GBEMU_FAST_MONO 0
+#endif
+
 struct gbemu_s {
   struct gb_s core;
   const uint8_t *rom_data;
@@ -73,18 +77,12 @@ static size_t decode_ram_size(uint8_t code) {
   return kRamSizes[code];
 }
 
-static inline void set_pixel(uint8_t *framebuffer, int x, int y, bool white) {
-  const size_t offset =
-      ((size_t)y * GBEMU_FRAME_PITCH_BYTES) + (size_t)(x >> 3);
-  const uint8_t mask = (uint8_t)(0x80U >> (x & 7));
-  if (white) {
-    framebuffer[offset] |= mask;
-  } else {
-    framebuffer[offset] &= (uint8_t)(~mask);
-  }
-}
-
-static bool shade_to_white(uint8_t shade, int x, int y) {
+static inline bool shade_to_white(uint8_t shade, int x, int y) {
+#if GBEMU_FAST_MONO
+  (void)x;
+  (void)y;
+  return (shade & 0x03U) <= 1U;
+#else
   static const uint8_t kBayer2x2[2][2] = {
       {0U, 2U},
       {3U, 1U},
@@ -93,14 +91,67 @@ static bool shade_to_white(uint8_t shade, int x, int y) {
 
   switch (shade & 0x03U) {
     case 0:
-      return false;
-    case 1:
-      return rank == 0U;
-    case 2:
-      return rank != 3U;
-    default:
       return true;
+    case 1:
+      return rank != 3U;
+    case 2:
+      return rank == 0U;
+    default:
+      return false;
   }
+#endif
+}
+
+static void pack_scaled_line(const uint8_t *pixels, uint8_t *framebuffer, uint_fast8_t line) {
+  const size_t dest_y_base = (size_t)line * GBEMU_SCALE;
+
+#if GBEMU_FAST_MONO
+  uint8_t packed[GBEMU_FRAME_PITCH_BYTES];
+  memset(packed, 0x00, sizeof(packed));
+
+  for (uint16_t src_x = 0; src_x < GBEMU_SOURCE_WIDTH; ++src_x) {
+    if (!shade_to_white(pixels[src_x], 0, 0)) {
+      continue;
+    }
+    const uint16_t dest_x_base = src_x * GBEMU_SCALE;
+    for (uint8_t dx = 0; dx < GBEMU_SCALE; ++dx) {
+      const uint16_t dest_x = dest_x_base + dx;
+      packed[dest_x >> 3] |= (uint8_t)(0x80U >> (dest_x & 7U));
+    }
+  }
+
+  for (uint8_t dy = 0; dy < GBEMU_SCALE; ++dy) {
+    memcpy(
+        framebuffer + ((dest_y_base + dy) * GBEMU_FRAME_PITCH_BYTES),
+        packed,
+        sizeof(packed));
+  }
+#else
+  uint8_t packed_rows[2][GBEMU_FRAME_PITCH_BYTES];
+  memset(packed_rows, 0x00, sizeof(packed_rows));
+
+  for (uint16_t src_x = 0; src_x < GBEMU_SOURCE_WIDTH; ++src_x) {
+    const uint8_t shade = pixels[src_x] & 0x03U;
+    const uint16_t dest_x_base = src_x * GBEMU_SCALE;
+    for (uint8_t parity = 0; parity < 2U; ++parity) {
+      for (uint8_t dx = 0; dx < GBEMU_SCALE; ++dx) {
+        const uint16_t dest_x = dest_x_base + dx;
+        if (shade_to_white(shade, dest_x, parity)) {
+          packed_rows[parity][dest_x >> 3] |=
+              (uint8_t)(0x80U >> (dest_x & 7U));
+        }
+      }
+    }
+  }
+
+  for (uint8_t dy = 0; dy < GBEMU_SCALE; ++dy) {
+    const size_t dest_y = dest_y_base + dy;
+    memcpy(
+        framebuffer + (dest_y * GBEMU_FRAME_PITCH_BYTES),
+        packed_rows[dest_y & 1U],
+        GBEMU_FRAME_PITCH_BYTES);
+  }
+#endif
 }
 
 static uint8_t gb_rom_read_cb(struct gb_s *gb, const uint_fast32_t addr) {
@@ -147,20 +198,7 @@ static void gb_lcd_draw_line_cb(struct gb_s *gb, const uint8_t *pixels, const ui
   }
 
   const int64_t started_at = esp_timer_get_time();
-  const int dest_y_base = (int)line * (int)GBEMU_SCALE;
-
-  for (uint16_t src_x = 0; src_x < GBEMU_SOURCE_WIDTH; ++src_x) {
-    const uint8_t shade = pixels[src_x] & 0x03U;
-    const int dest_x_base = (int)src_x * (int)GBEMU_SCALE;
-
-    for (uint8_t dy = 0; dy < GBEMU_SCALE; ++dy) {
-      const int dest_y = dest_y_base + (int)dy;
-      for (uint8_t dx = 0; dx < GBEMU_SCALE; ++dx) {
-        const int dest_x = dest_x_base + (int)dx;
-        set_pixel(emu->framebuffer, dest_x, dest_y, shade_to_white(shade, dest_x, dest_y));
-      }
-    }
-  }
+  pack_scaled_line(pixels, emu->framebuffer, line);
 
   emu->draw_us_accum += (uint32_t)(esp_timer_get_time() - started_at);
   ++emu->lines_drawn;
@@ -304,10 +342,6 @@ bool gbemu_run_frame(
   emu->framebuffer_size = framebuffer_size;
   emu->render_enabled = !skip_render;
   emu->core.direct.joypad = (uint8_t)(~input_mask);
-
-  if (!skip_render) {
-    memset(framebuffer, 0xFF, GBEMU_FRAMEBUFFER_SIZE);
-  }
 
   gb_run_frame(&emu->core);
 

@@ -44,7 +44,7 @@ static constexpr uint8_t kPcaMaskShutdownOutputs =
 }  // namespace t5s3_epd
 
 #ifndef TARGET_FPS
-#define TARGET_FPS 18
+#define TARGET_FPS 24
 #endif
 
 #ifndef EPD_PARTIAL_PASSES

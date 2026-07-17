@@ -31,6 +31,7 @@ constexpr size_t kActiveLeftPadBytes = t5s3_epd::kActiveX / 4U;
 constexpr size_t kActiveRowBytes = t5s3_epd::kActiveWidth / 4U;
 constexpr size_t kActiveRightPadBytes = kPanelRowBytes - kActiveLeftPadBytes - kActiveRowBytes;
 constexpr uint8_t kResetCounterMask[4] = {0xFC, 0xE0, 0x1C, 0x00};
+constexpr uint8_t kVideoDrivePasses = 3;
 constexpr uint8_t kTpsRegEnable = 0x01;
 constexpr uint8_t kTpsRegVcom = 0x03;
 constexpr uint8_t kTpsRegPowerGood = 0x0F;
@@ -82,6 +83,7 @@ uint8_t g_row_active[t5s3_epd::kActiveHeight] = {0};
 volatile bool g_running = false;
 volatile bool g_dma_done = true;
 volatile bool g_flip_req = false;
+volatile bool g_drive_pending = false;
 volatile uint8_t g_front_index = 0;
 volatile uint32_t g_vsync_count = 0;
 volatile uint32_t g_submit_count = 0;
@@ -415,8 +417,9 @@ bool send_row(uint8_t *data, bool first_row) {
   return true;
 }
 
-// Each state byte tracks two pixels: direction bits in the LSBs and two
-// independent 2-bit pulse counters in the upper nibbles.
+// Each state byte tracks two pixels: direction bits in the LSBs and independent
+// pulse counters in the upper nibbles. Three complete scans improve black
+// density; a frame remains pending until all three scans have completed.
 bool build_active_row(const uint8_t *frame, uint16_t row, uint8_t *dst) {
   uint8_t *wrptr = dst + kActiveLeftPadBytes;
   const uint8_t *rdptr = frame + (static_cast<size_t>(row) * kSourceRowBytes);
@@ -441,6 +444,12 @@ bool build_active_row(const uint8_t *frame, uint16_t row, uint8_t *dst) {
 
         const uint8_t counter_increment = static_cast<uint8_t>(((~state) >> 2) & 0x24U);
         state = static_cast<uint8_t>(state + counter_increment);
+        if (((state >> 5) & 0x07U) >= kVideoDrivePasses) {
+          state |= 0x80U;
+        }
+        if (((state >> 2) & 0x07U) >= kVideoDrivePasses) {
+          state |= 0x10U;
+        }
         needs_more_drive = needs_more_drive || ((state & 0x90U) != 0x90U);
         *stptr++ = state;
 
@@ -544,8 +553,10 @@ void scan_task(void *unused) {
     submitted_frames = g_submit_count;
     portEXIT_CRITICAL(&g_buffer_lock);
 
-    if (waiter_to_notify != nullptr) {
+    if (applied_flip) {
       mark_rows_active(dirty_start, dirty_end);
+    }
+    if (waiter_to_notify != nullptr) {
       xTaskNotifyGive(waiter_to_notify);
     }
 
@@ -585,6 +596,12 @@ void scan_task(void *unused) {
       break;
     }
     wait_for_dma();
+    portENTER_CRITICAL(&g_buffer_lock);
+    // A submit can arrive while this scan is in progress. Preserve the busy
+    // state when a flip is queued so the producer cannot submit again in the
+    // gap between accepting that flip and completing its first drive pass.
+    g_drive_pending = (continuing_rows != 0U) || g_flip_req;
+    portEXIT_CRITICAL(&g_buffer_lock);
 
     ++log_frames;
     log_scan_us += static_cast<uint64_t>(esp_timer_get_time() - frame_start_us);
@@ -682,6 +699,7 @@ bool epd_video_power_on() {
   memset(g_dma_buf[1], 0x00, kDmaRowBytes);
   memset(g_blank_row, 0x00, kDmaRowBytes);
   memset(g_row_active, 0x00, sizeof(g_row_active));
+  g_drive_pending = false;
   configure_idle_levels();
 
   bool after_power_good = false;
@@ -711,6 +729,7 @@ bool epd_video_start() {
   g_dma_done = true;
   g_running = true;
   memset(g_row_active, 0x00, sizeof(g_row_active));
+  g_drive_pending = false;
 
   const BaseType_t rc = xTaskCreatePinnedToCore(
       scan_task,
@@ -756,9 +775,41 @@ void epd_video_flip(uint16_t dirty_y, uint16_t dirty_height) {
   g_pending_dirty_end = row_end;
   g_flip_waiter = self;
   g_flip_req = true;
+  g_drive_pending = true;
   portEXIT_CRITICAL(&g_buffer_lock);
 
   (void)ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+}
+
+bool epd_video_submit(uint16_t dirty_y, uint16_t dirty_height) {
+  if (!g_running) {
+    return false;
+  }
+
+  uint16_t row_start = 0;
+  uint16_t row_end = 0;
+  sanitize_dirty_region(dirty_y, dirty_height, row_start, row_end);
+
+  bool accepted = false;
+  portENTER_CRITICAL(&g_buffer_lock);
+  if (!g_flip_req) {
+    g_pending_dirty_start = row_start;
+    g_pending_dirty_end = row_end;
+    g_flip_waiter = nullptr;
+    g_flip_req = true;
+    g_drive_pending = true;
+    accepted = true;
+  }
+  portEXIT_CRITICAL(&g_buffer_lock);
+  return accepted;
+}
+
+bool epd_video_submit_pending() {
+  bool pending = false;
+  portENTER_CRITICAL(&g_buffer_lock);
+  pending = g_flip_req || g_drive_pending;
+  portEXIT_CRITICAL(&g_buffer_lock);
+  return pending;
 }
 
 uint32_t epd_video_get_vsync_count() {
@@ -767,6 +818,7 @@ uint32_t epd_video_get_vsync_count() {
 
 void epd_video_shutdown() {
   g_running = false;
+  g_drive_pending = false;
 
   TaskHandle_t waiter_to_notify = nullptr;
   portENTER_CRITICAL(&g_buffer_lock);

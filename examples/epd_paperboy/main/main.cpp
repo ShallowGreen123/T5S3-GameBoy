@@ -27,8 +27,10 @@
 namespace {
 
 constexpr const char *kTag = "paperboy";
-constexpr const char *kFirmwareVersion = "portrait-v4";
-constexpr uint8_t kMaxConsecutiveSkippedFrames = 2;
+constexpr const char *kFirmwareVersion = "video-v9";
+constexpr uint8_t kMinSkippedFramesBetweenRenders = 1;
+constexpr uint8_t kPanelBufferCount = 2;
+constexpr int64_t kGameFramePeriodUs = 16742;
 constexpr uint16_t kPanelPitch = t5s3_epd::kActiveWidth / 8U;
 constexpr size_t kScreenBytes =
     static_cast<size_t>(kPanelPitch) * t5s3_epd::kActiveHeight;
@@ -36,6 +38,9 @@ constexpr size_t kPortraitBytes =
     static_cast<size_t>(PAPERBOY_LOGICAL_PITCH) * PAPERBOY_LOGICAL_HEIGHT;
 constexpr uint16_t kDynamicDirtyY = 20;
 constexpr uint16_t kDynamicDirtyHeight = 500;
+constexpr uint16_t kGameDirtyY =
+    PAPERBOY_LOGICAL_WIDTH - PAPERBOY_GAME_X - GBEMU_FRAME_WIDTH;
+constexpr uint16_t kGameDirtyHeight = GBEMU_FRAME_WIDTH;
 constexpr uint8_t kClearWhiteFrames = 5;
 constexpr uint8_t kClearBlackFrames = 7;
 
@@ -185,6 +190,59 @@ void rotate_portrait_to_panel(const uint8_t *portrait, uint8_t *panel) {
       // The raw panel data polarity is the inverse of the logical canvas:
       // zero drives paper white and one drives paper black.
       dest[byte_x] = static_cast<uint8_t>(~packed);
+    }
+  }
+}
+
+void rotate_game_to_panel(const uint8_t *game, uint8_t *panel) {
+  if (game == nullptr || panel == nullptr) {
+    return;
+  }
+
+  const size_t dest_byte_x = PAPERBOY_GAME_Y / 8U;
+  for (uint16_t panel_y = kGameDirtyY;
+       panel_y < (kGameDirtyY + kGameDirtyHeight);
+       ++panel_y) {
+    const uint16_t logical_x =
+        static_cast<uint16_t>(PAPERBOY_LOGICAL_WIDTH - 1U - panel_y);
+    const uint16_t game_x = static_cast<uint16_t>(logical_x - PAPERBOY_GAME_X);
+    const size_t source_byte_x = game_x >> 3;
+    const uint8_t source_mask = static_cast<uint8_t>(0x80U >> (game_x & 7U));
+    uint8_t *dest =
+        panel + (static_cast<size_t>(panel_y) * kPanelPitch) + dest_byte_x;
+
+    for (uint16_t byte_y = 0; byte_y < (GBEMU_FRAME_HEIGHT / 8U); ++byte_y) {
+      const uint16_t game_y_base = byte_y * 8U;
+      uint8_t packed = 0;
+      for (uint8_t bit = 0; bit < 8U; ++bit) {
+        const size_t source_offset =
+            (static_cast<size_t>(game_y_base + bit) * GBEMU_FRAME_PITCH_BYTES) +
+            source_byte_x;
+        if ((game[source_offset] & source_mask) != 0U) {
+          packed |= static_cast<uint8_t>(0x80U >> bit);
+        }
+      }
+      dest[byte_y] = static_cast<uint8_t>(~packed);
+    }
+  }
+}
+
+void pace_game_frame(int64_t &next_frame_us) {
+  next_frame_us += kGameFramePeriodUs;
+  while (true) {
+    const int64_t now = esp_timer_get_time();
+    const int64_t remaining_us = next_frame_us - now;
+    if (remaining_us <= 0) {
+      if (-remaining_us > (kGameFramePeriodUs * 4)) {
+        next_frame_us = now;
+      }
+      return;
+    }
+    if (remaining_us > 2000) {
+      vTaskDelay(1);
+    } else {
+      delayMicroseconds(static_cast<unsigned int>(remaining_us));
+      return;
     }
   }
 }
@@ -344,8 +402,10 @@ void run_console(void *unused) {
   bool power_on = true;
   uint8_t last_buttons = 0;
   bool last_touch_down = false;
-  uint8_t consecutive_skips = 0;
+  uint8_t full_scene_syncs = 0;
+  uint8_t skipped_since_render = 0;
   uint32_t last_vsync = epd_video_get_vsync_count();
+  int64_t next_game_frame_us = esp_timer_get_time();
   uint64_t stats_started = esp_timer_get_time();
   uint32_t emulated_frames = 0;
   uint32_t rendered_frames = 0;
@@ -353,12 +413,14 @@ void run_console(void *unused) {
   uint32_t missed_vsyncs = 0;
   TimingWindow run_timing = {};
   TimingWindow draw_timing = {};
+  TimingWindow compose_timing = {};
   TimingWindow flip_timing = {};
 
   set_status(g_touch_available ? "READY - TOUCH START" : "TOUCH NOT FOUND", 3000U);
   uint8_t *initial = epd_video_get_backbuffer();
   compose_scene(initial, 0, power_on);
   epd_video_flip(0, t5s3_epd::kActiveHeight);
+  memcpy(epd_video_get_backbuffer(), initial, kScreenBytes);
 
   while (true) {
     touch_state_t touch = {};
@@ -369,7 +431,9 @@ void run_console(void *unused) {
 
     const uint8_t buttons = touch_ok ? paperboy_ui_map_buttons(&touch) : 0U;
     const uint32_t actions = touch_ok ? paperboy_ui_map_actions(&touch) : 0U;
-    bool force_render = buttons != last_buttons;
+    if (buttons != last_buttons) {
+      full_scene_syncs = kPanelBufferCount;
+    }
 
     const bool touch_down = touch_ok && touch.touched && touch.points > 0U;
     if (touch_down && !last_touch_down) {
@@ -394,7 +458,7 @@ void run_console(void *unused) {
     if ((actions & PAPERBOY_ACTION_POWER) != 0U) {
       power_on = !power_on;
       set_status(power_on ? "POWER ON" : "SOFT POWER OFF");
-      force_render = true;
+      full_scene_syncs = kPanelBufferCount;
       ESP_LOGI(kTag, "soft power=%s", power_on ? "on" : "off");
     }
 
@@ -408,7 +472,7 @@ void run_console(void *unused) {
         set_status("SAVE UNAVAILABLE");
         ESP_LOGW(kTag, "quick save unavailable");
       }
-      force_render = true;
+      full_scene_syncs = kPanelBufferCount;
     }
 
     if ((actions & PAPERBOY_ACTION_LOAD) != 0U) {
@@ -421,18 +485,23 @@ void run_console(void *unused) {
         set_status("NO SAVED STATE");
         ESP_LOGW(kTag, "quick load requested without a state");
       }
-      force_render = true;
+      full_scene_syncs = kPanelBufferCount;
     }
 
     if (power_on) {
       const uint32_t vsync_now = epd_video_get_vsync_count();
       const uint32_t vsync_gap = vsync_now - last_vsync;
-      const bool skip_render =
-          !force_render && vsync_gap > 0U &&
-          consecutive_skips < kMaxConsecutiveSkippedFrames;
+      if (vsync_gap > 1U) {
+        missed_vsyncs += vsync_gap - 1U;
+      }
+      last_vsync = vsync_now;
+
+      const bool render_due =
+          full_scene_syncs > 0U ||
+          skipped_since_render >= kMinSkippedFramesBetweenRenders;
+      const bool skip_render = !render_due || epd_video_submit_pending();
       gbemu_frame_stats_t frame_stats = {};
 
-      missed_vsyncs += vsync_gap;
       if (!gbemu_run_frame(
               g_emu,
               skip_render ? nullptr : g_game_frame,
@@ -453,26 +522,49 @@ void run_console(void *unused) {
       ++emulated_frames;
       if (skip_render) {
         ++skipped_frames;
-        ++consecutive_skips;
-        last_vsync = epd_video_get_vsync_count();
-        vTaskDelay(1);
+        if (skipped_since_render < UINT8_MAX) {
+          ++skipped_since_render;
+        }
       } else {
         uint8_t *backbuffer = epd_video_get_backbuffer();
-        compose_scene(backbuffer, buttons, power_on);
+        const int64_t compose_started = esp_timer_get_time();
+        const bool full_scene = full_scene_syncs > 0U;
+        if (full_scene) {
+          compose_scene(backbuffer, buttons, power_on);
+        } else {
+          rotate_game_to_panel(g_game_frame, backbuffer);
+        }
+        add_sample(
+            compose_timing,
+            static_cast<uint32_t>(esp_timer_get_time() - compose_started));
         add_sample(draw_timing, frame_stats.draw_us);
         const int64_t flip_started = esp_timer_get_time();
-        epd_video_flip(kDynamicDirtyY, kDynamicDirtyHeight);
+        const bool submitted = epd_video_submit(
+            full_scene ? kDynamicDirtyY : kGameDirtyY,
+            full_scene ? kDynamicDirtyHeight : kGameDirtyHeight);
         add_sample(flip_timing, static_cast<uint32_t>(esp_timer_get_time() - flip_started));
-        ++rendered_frames;
-        consecutive_skips = 0;
-        last_vsync = epd_video_get_vsync_count();
+        if (submitted) {
+          ++rendered_frames;
+          skipped_since_render = 0;
+          if (full_scene_syncs > 0U) {
+            --full_scene_syncs;
+          }
+        } else {
+          ++skipped_frames;
+          if (skipped_since_render < UINT8_MAX) {
+            ++skipped_since_render;
+          }
+        }
       }
-    } else if (force_render) {
+      pace_game_frame(next_game_frame_us);
+    } else if (full_scene_syncs > 0U && !epd_video_submit_pending()) {
       uint8_t *backbuffer = epd_video_get_backbuffer();
       compose_scene(backbuffer, buttons, power_on);
-      epd_video_flip(kDynamicDirtyY, kDynamicDirtyHeight);
-      last_vsync = epd_video_get_vsync_count();
+      if (epd_video_submit(kDynamicDirtyY, kDynamicDirtyHeight)) {
+        --full_scene_syncs;
+      }
     } else {
+      next_game_frame_us = esp_timer_get_time();
       vTaskDelay(pdMS_TO_TICKS(5));
     }
 
@@ -482,7 +574,7 @@ void run_console(void *unused) {
     if ((now - stats_started) >= 1000000ULL) {
       ESP_LOGI(
           kTag,
-          "power=%s emu=%lu render=%lu skip=%lu missed=%lu run(us avg/max)=%lu/%lu draw=%lu/%lu flip=%lu/%lu heap=%u psram=%u",
+          "power=%s emu=%lu render=%lu skip=%lu missed=%lu run(us avg/max)=%lu/%lu draw=%lu/%lu compose=%lu/%lu submit=%lu/%lu heap=%u psram=%u",
           power_on ? "on" : "off",
           (unsigned long)emulated_frames,
           (unsigned long)rendered_frames,
@@ -492,6 +584,8 @@ void run_console(void *unused) {
           (unsigned long)run_timing.max_us,
           (unsigned long)average_us(draw_timing),
           (unsigned long)draw_timing.max_us,
+          (unsigned long)average_us(compose_timing),
+          (unsigned long)compose_timing.max_us,
           (unsigned long)average_us(flip_timing),
           (unsigned long)flip_timing.max_us,
           (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
@@ -503,6 +597,7 @@ void run_console(void *unused) {
       missed_vsyncs = 0;
       run_timing = {};
       draw_timing = {};
+      compose_timing = {};
       flip_timing = {};
     }
   }
