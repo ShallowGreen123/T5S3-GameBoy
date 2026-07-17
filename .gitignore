@@ -7,3 +7,4 @@ examples/epd_gb_frame_probe/main/rom/test_rom.h
 examples/epd_gb_touch_probe/main/rom/test_rom.h
 examples/epd_paperboy/main/rom/test_rom.h
 other
+script/

@@ -71,7 +71,7 @@ pio run -t upload
 | SELECT / START | Game Boy SELECT / START |
 | 设置页 BACK | 返回上一级；设置首页返回游戏主页面 |
 | 设置页 HOME / 电容 HOME | 直接返回游戏主页面 |
-| BOOT | 对当前页面执行一次整屏刷新 |
+| BOOT | 白黑白清屏后重新绘制当前页面，执行一次可见的整屏刷新 |
 | 主页面长按 PCA9535 实体键 2 秒 | 白黑白清屏、稳定显示关机信息后，通过 BQ25896 断开电池供电；USB 连接时进入深度睡眠 |
 
 `Battery Status` 参考 T5S3-Reader，读取 BQ27220 的电量、电压、电流、容量、健康度、

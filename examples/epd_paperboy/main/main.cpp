@@ -29,7 +29,7 @@
 namespace {
 
 constexpr const char *kTag = "paperboy";
-constexpr const char *kFirmwareVersion = "video-v11-controls";
+constexpr const char *kFirmwareVersion = "video-v12-boot-refresh";
 constexpr uint8_t kMinSkippedFramesBetweenRenders = 1;
 constexpr uint8_t kPanelBufferCount = 2;
 constexpr int64_t kGameFramePeriodUs = 16742;
@@ -71,6 +71,11 @@ size_t g_quicksave_size = 0;
 bool g_quicksave_valid = false;
 bool g_touch_available = false;
 const char *g_idle_reason = nullptr;
+volatile bool g_boot_refresh_irq = false;
+
+void IRAM_ATTR on_boot_button_falling() {
+  g_boot_refresh_irq = true;
+}
 
 const uint8_t *rom_data() {
 #if PAPERBOY_HAS_CUSTOM_ROM
@@ -428,30 +433,54 @@ void draw_shutdown_page() {
       162, 560, "HOLD PWR TO START", 2, false);
 }
 
-void present_shutdown_page() {
+void wait_epd_idle() {
   while (epd_video_submit_pending()) {
     vTaskDelay(1);
   }
-  ESP_LOGI(kTag, "shutdown refresh: white -> black -> white");
+}
+
+void clean_panel_white_black_white(const char *reason) {
+  wait_epd_idle();
+  ESP_LOGI(kTag, "%s refresh: white -> black -> white", reason);
   submit_clear_frame(true, kClearWhiteFrames);
   submit_clear_frame(false, kClearBlackFrames);
   submit_clear_frame(true, kClearWhiteFrames);
+  wait_epd_idle();
+}
+
+void refresh_current_page(
+    PaperboyPage page,
+    bool power_on,
+    const BatteryStatus *battery) {
+  clean_panel_white_black_white("BOOT");
+  ESP_LOGI(kTag, "BOOT refresh: redrawing page=%u", static_cast<unsigned>(page));
+
+  for (uint8_t copy = 0; copy < kPanelBufferCount; ++copy) {
+    wait_epd_idle();
+    uint8_t *backbuffer = epd_video_get_backbuffer();
+    compose_scene(backbuffer, 0, power_on, page, battery);
+    while (!epd_video_submit(0, t5s3_epd::kActiveHeight)) {
+      vTaskDelay(1);
+    }
+  }
+  wait_epd_idle();
+  ESP_LOGI(kTag, "BOOT refresh: complete");
+}
+
+void present_shutdown_page() {
+  clean_panel_white_black_white("shutdown");
 
   ESP_LOGI(kTag, "shutdown refresh: presenting power-off message");
   draw_shutdown_page();
   for (uint8_t copy = 0; copy < kPanelBufferCount; ++copy) {
-    while (epd_video_submit_pending()) {
-      vTaskDelay(1);
-    }
+    wait_epd_idle();
     uint8_t *backbuffer = epd_video_get_backbuffer();
     rotate_portrait_to_panel(g_scene, backbuffer);
     while (!epd_video_submit(0, t5s3_epd::kActiveHeight)) {
       vTaskDelay(1);
     }
   }
-  while (epd_video_submit_pending()) {
-    vTaskDelay(1);
-  }
+  wait_epd_idle();
   delay(kShutdownMessageSettleMs);
   ESP_LOGI(kTag, "shutdown refresh: message stable, cutting power");
 }
@@ -499,10 +528,10 @@ void run_console(void *unused) {
   uint8_t last_buttons = 0;
   bool last_touch_down = false;
   bool last_boot_pressed = digitalRead(t5s3_epd::kBootButton) == LOW;
+  bool boot_refresh_armed = !last_boot_pressed;
   uint32_t pca_button_pressed_since_ms = 0;
   uint32_t last_boot_refresh_ms = 0;
   uint8_t full_scene_syncs = 0;
-  uint8_t full_panel_syncs = 0;
   uint8_t skipped_since_render = 0;
   uint32_t last_vsync = epd_video_get_vsync_count();
   int64_t next_game_frame_us = esp_timer_get_time();
@@ -549,15 +578,33 @@ void run_console(void *unused) {
     }
 
     const bool boot_pressed = digitalRead(t5s3_epd::kBootButton) == LOW;
-    if (boot_pressed && !last_boot_pressed &&
+    const bool boot_irq = g_boot_refresh_irq;
+    const bool boot_edge = boot_pressed && !last_boot_pressed;
+    bool boot_refresh_completed = false;
+    if (boot_refresh_armed && (boot_irq || boot_edge) &&
         (millis() - last_boot_refresh_ms) >= kBootDebounceMs) {
+      boot_refresh_armed = false;
+      g_boot_refresh_irq = false;
       last_boot_refresh_ms = millis();
-      full_scene_syncs = kPanelBufferCount;
-      full_panel_syncs = page == PaperboyPage::Game ? kPanelBufferCount : 0U;
-      ESP_LOGI(kTag, "BOOT pressed: full-screen refresh requested page=%u",
+      ESP_LOGI(kTag, "BOOT pressed: clean full-screen refresh page=%u",
                static_cast<unsigned>(page));
+      refresh_current_page(
+          page,
+          power_on,
+          page == PaperboyPage::Game ? nullptr : &battery);
+      full_scene_syncs = 0U;
+      skipped_since_render = 0U;
+      next_game_frame_us = esp_timer_get_time();
+      boot_refresh_completed = true;
+      g_boot_refresh_irq = false;
     }
-    last_boot_pressed = boot_pressed;
+    const bool boot_pressed_after_refresh =
+        digitalRead(t5s3_epd::kBootButton) == LOW;
+    if (!boot_pressed_after_refresh && !boot_refresh_completed && !boot_refresh_armed) {
+      boot_refresh_armed = true;
+      g_boot_refresh_irq = false;
+    }
+    last_boot_pressed = boot_pressed_after_refresh;
 
     const bool touch_down = touch_ok && touch.touched && touch.points > 0U;
     if (touch_down && !last_touch_down) {
@@ -642,7 +689,6 @@ void run_console(void *unused) {
       page = next_page;
       paperboy_ui_on_page_changed();
       full_scene_syncs = kPanelBufferCount;
-      full_panel_syncs = 0U;
       skipped_since_render = 0;
       next_game_frame_us = esp_timer_get_time();
     }
@@ -669,7 +715,6 @@ void run_console(void *unused) {
 
       const bool render_due =
           full_scene_syncs > 0U ||
-          full_panel_syncs > 0U ||
           skipped_since_render >= kMinSkippedFramesBetweenRenders;
       const bool skip_render = !render_due || epd_video_submit_pending();
       gbemu_frame_stats_t frame_stats = {};
@@ -700,8 +745,7 @@ void run_console(void *unused) {
       } else {
         uint8_t *backbuffer = epd_video_get_backbuffer();
         const int64_t compose_started = esp_timer_get_time();
-        const bool full_scene = full_scene_syncs > 0U || full_panel_syncs > 0U;
-        const bool full_panel = full_panel_syncs > 0U;
+        const bool full_scene = full_scene_syncs > 0U;
         if (full_scene) {
           compose_scene(backbuffer, buttons, power_on, page, nullptr);
         } else {
@@ -713,18 +757,14 @@ void run_console(void *unused) {
         add_sample(draw_timing, frame_stats.draw_us);
         const int64_t flip_started = esp_timer_get_time();
         const bool submitted = epd_video_submit(
-            full_panel ? 0U : (full_scene ? kDynamicDirtyY : kGameDirtyY),
-            full_panel ? t5s3_epd::kActiveHeight :
-                (full_scene ? kDynamicDirtyHeight : kGameDirtyHeight));
+            full_scene ? kDynamicDirtyY : kGameDirtyY,
+            full_scene ? kDynamicDirtyHeight : kGameDirtyHeight);
         add_sample(flip_timing, static_cast<uint32_t>(esp_timer_get_time() - flip_started));
         if (submitted) {
           ++rendered_frames;
           skipped_since_render = 0;
           if (full_scene_syncs > 0U) {
             --full_scene_syncs;
-          }
-          if (full_panel_syncs > 0U) {
-            --full_panel_syncs;
           }
         } else {
           ++skipped_frames;
@@ -737,14 +777,8 @@ void run_console(void *unused) {
     } else if (page == PaperboyPage::Game && full_scene_syncs > 0U && !epd_video_submit_pending()) {
       uint8_t *backbuffer = epd_video_get_backbuffer();
       compose_scene(backbuffer, buttons, power_on, page, nullptr);
-      const bool full_panel = full_panel_syncs > 0U;
-      if (epd_video_submit(
-              full_panel ? 0U : kDynamicDirtyY,
-              full_panel ? t5s3_epd::kActiveHeight : kDynamicDirtyHeight)) {
+      if (epd_video_submit(kDynamicDirtyY, kDynamicDirtyHeight)) {
         --full_scene_syncs;
-        if (full_panel_syncs > 0U) {
-          --full_panel_syncs;
-        }
       }
     } else if (page != PaperboyPage::Game &&
                full_scene_syncs > 0U && !epd_video_submit_pending()) {
@@ -830,6 +864,10 @@ void setup() {
   g_touch_available = touch_init();
   touch_set_rotation(0);
   pinMode(t5s3_epd::kBootButton, INPUT_PULLUP);
+  attachInterrupt(
+      digitalPinToInterrupt(t5s3_epd::kBootButton),
+      on_boot_button_falling,
+      FALLING);
   paperboy_ui_init();
   if (!allocate_runtime()) {
     enter_idle("runtime buffer allocation failed", "MEMORY ERROR", "BUFFER ALLOCATION");
