@@ -42,11 +42,12 @@ void paperboy_ui_draw_dynamic(
     uint8_t *framebuffer,
     uint8_t buttons,
     bool power_on,
-    bool save_available);
+    bool save_available,
+    const PaperboyBatteryStatus *battery);
 void paperboy_ui_draw_page(
     uint8_t *framebuffer,
     PaperboyPage page,
-    const BatteryStatus *battery,
+    const PaperboyBatteryStatus *battery,
     const char *firmware_version,
     const char *rom_title,
     bool touch_available);

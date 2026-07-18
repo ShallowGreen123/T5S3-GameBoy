@@ -29,7 +29,7 @@
 namespace {
 
 constexpr const char *kTag = "paperboy";
-constexpr const char *kFirmwareVersion = "video-v12-boot-refresh";
+constexpr const char *kFirmwareVersion = "video-v13-charge";
 constexpr uint8_t kMinSkippedFramesBetweenRenders = 1;
 constexpr uint8_t kPanelBufferCount = 2;
 constexpr int64_t kGameFramePeriodUs = 16742;
@@ -48,6 +48,7 @@ constexpr uint8_t kClearBlackFrames = 7;
 constexpr uint32_t kPowerButtonHoldMs = 2000U;
 constexpr uint32_t kBootDebounceMs = 180U;
 constexpr uint32_t kShutdownMessageSettleMs = 500U;
+constexpr uint32_t kBatteryPollMs = 15000U;
 
 static_assert(GBEMU_FRAME_WIDTH == 480U, "unexpected GB frame width");
 static_assert(GBEMU_FRAME_HEIGHT == 432U, "unexpected GB frame height");
@@ -111,6 +112,23 @@ void add_sample(TimingWindow &window, uint32_t value_us) {
 
 uint32_t average_us(const TimingWindow &window) {
   return window.count == 0U ? 0U : static_cast<uint32_t>(window.total_us / window.count);
+}
+
+uint16_t bounded_soc(const PaperboyBatteryStatus &battery) {
+  return battery.soc_percent > 100U ? 100U : battery.soc_percent;
+}
+
+bool battery_indicator_changed(
+    const PaperboyBatteryStatus &before,
+    const PaperboyBatteryStatus &after) {
+  return before.gauge_read_ok != after.gauge_read_ok ||
+      before.charger_read_ok != after.charger_read_ok ||
+      (after.gauge_read_ok && bounded_soc(before) != bounded_soc(after)) ||
+      before.usb_connected != after.usb_connected ||
+      before.charging != after.charging ||
+      before.charge_done != after.charge_done ||
+      before.charge_enabled != after.charge_enabled ||
+      before.fault_present != after.fault_present;
 }
 
 uint8_t *allocate_buffer(size_t size, bool prefer_internal) {
@@ -244,7 +262,7 @@ void compose_scene(
     uint8_t buttons,
     bool power_on,
     PaperboyPage page,
-    const BatteryStatus *battery) {
+    const PaperboyBatteryStatus *battery) {
   if (framebuffer == nullptr || g_background == nullptr ||
       g_scene == nullptr || g_game_frame == nullptr) {
     return;
@@ -257,7 +275,8 @@ void compose_scene(
     } else {
       draw_power_off_screen(g_scene);
     }
-    paperboy_ui_draw_dynamic(g_scene, buttons, power_on, g_quicksave_valid);
+    paperboy_ui_draw_dynamic(
+        g_scene, buttons, power_on, g_quicksave_valid, battery);
   } else {
     paperboy_ui_draw_page(
         g_scene,
@@ -451,7 +470,7 @@ void clean_panel_white_black_white(const char *reason) {
 void refresh_current_page(
     PaperboyPage page,
     bool power_on,
-    const BatteryStatus *battery) {
+    const PaperboyBatteryStatus *battery) {
   clean_panel_white_black_white("BOOT");
   ESP_LOGI(kTag, "BOOT refresh: redrawing page=%u", static_cast<unsigned>(page));
 
@@ -524,13 +543,14 @@ void run_console(void *unused) {
 
   bool power_on = true;
   PaperboyPage page = PaperboyPage::Game;
-  BatteryStatus battery = {};
+  PaperboyBatteryStatus battery = {};
   uint8_t last_buttons = 0;
   bool last_touch_down = false;
   bool last_boot_pressed = digitalRead(t5s3_epd::kBootButton) == LOW;
   bool boot_refresh_armed = !last_boot_pressed;
   uint32_t pca_button_pressed_since_ms = 0;
   uint32_t last_boot_refresh_ms = 0;
+  uint32_t last_battery_poll_ms = millis();
   uint8_t full_scene_syncs = 0;
   uint8_t skipped_since_render = 0;
   uint32_t last_vsync = epd_video_get_vsync_count();
@@ -557,17 +577,67 @@ void run_console(void *unused) {
       battery.current_ma,
       battery.average_current_ma,
       battery.usb_connected ? "yes" : "no");
+  ESP_LOGI(
+      kTag,
+      "charger enabled=%u hiz=%u batfet_disabled=%u otg=%u status=%u "
+      "fault=0x%02X input=%u/%u mA ichg=%u adc=%u mA vreg=%u mV "
+      "vbus=%u mV vsys=%u mV",
+      battery.charge_enabled ? 1U : 0U,
+      battery.hiz_enabled ? 1U : 0U,
+      battery.batfet_disabled ? 1U : 0U,
+      battery.otg_enabled ? 1U : 0U,
+      battery.charge_status,
+      static_cast<unsigned>(
+          (battery.watchdog_fault ? 0x80U : 0U) |
+          (battery.boost_fault ? 0x40U : 0U) |
+          ((battery.charge_fault & 0x03U) << 4U) |
+          (battery.battery_fault ? 0x08U : 0U) |
+          (battery.ntc_fault & 0x07U)),
+      battery.active_input_limit_ma,
+      battery.configured_input_limit_ma,
+      battery.configured_charge_current_ma,
+      battery.charger_adc_current_ma,
+      battery.configured_charge_voltage_mv,
+      battery.vbus_voltage_mv,
+      battery.system_voltage_mv);
 
   uint8_t *initial = epd_video_get_backbuffer();
-  compose_scene(initial, 0, power_on, page, nullptr);
+  compose_scene(initial, 0, power_on, page, &battery);
   epd_video_flip(0, t5s3_epd::kActiveHeight);
   memcpy(epd_video_get_backbuffer(), initial, kScreenBytes);
 
   while (true) {
+    battery_service();
     touch_state_t touch = {};
     const bool touch_ok = g_touch_available && touch_read(&touch);
     if (g_touch_available) {
       touch_debug_dump_once_per_second();
+    }
+
+    const uint32_t now_ms = millis();
+    if ((now_ms - last_battery_poll_ms) >= kBatteryPollMs) {
+      last_battery_poll_ms = now_ms;
+      PaperboyBatteryStatus latest_battery = {};
+      const bool ok = battery_read_status(latest_battery);
+      const bool indicator_changed =
+          battery_indicator_changed(battery, latest_battery);
+      battery = latest_battery;
+      ESP_LOGI(
+          kTag,
+          "battery poll=%s soc=%u usb=%u charging=%u full=%u enabled=%u "
+          "fault=%u current=%d adc=%u",
+          ok ? "ok" : "failed",
+          battery.soc_percent,
+          battery.usb_connected ? 1U : 0U,
+          battery.charging ? 1U : 0U,
+          battery.charge_done ? 1U : 0U,
+          battery.charge_enabled ? 1U : 0U,
+          battery.fault_present ? 1U : 0U,
+          battery.average_current_ma,
+          battery.charger_adc_current_ma);
+      if (indicator_changed && page == PaperboyPage::Game) {
+        full_scene_syncs = kPanelBufferCount;
+      }
     }
 
     const uint8_t buttons =
@@ -591,7 +661,7 @@ void run_console(void *unused) {
       refresh_current_page(
           page,
           power_on,
-          page == PaperboyPage::Game ? nullptr : &battery);
+          &battery);
       full_scene_syncs = 0U;
       skipped_since_render = 0U;
       next_game_frame_us = esp_timer_get_time();
@@ -747,7 +817,7 @@ void run_console(void *unused) {
         const int64_t compose_started = esp_timer_get_time();
         const bool full_scene = full_scene_syncs > 0U;
         if (full_scene) {
-          compose_scene(backbuffer, buttons, power_on, page, nullptr);
+          compose_scene(backbuffer, buttons, power_on, page, &battery);
         } else {
           rotate_game_to_panel(g_game_frame, backbuffer);
         }
@@ -776,7 +846,7 @@ void run_console(void *unused) {
       pace_game_frame(next_game_frame_us);
     } else if (page == PaperboyPage::Game && full_scene_syncs > 0U && !epd_video_submit_pending()) {
       uint8_t *backbuffer = epd_video_get_backbuffer();
-      compose_scene(backbuffer, buttons, power_on, page, nullptr);
+      compose_scene(backbuffer, buttons, power_on, page, &battery);
       if (epd_video_submit(kDynamicDirtyY, kDynamicDirtyHeight)) {
         --full_scene_syncs;
       }
@@ -860,6 +930,9 @@ void setup() {
   }
 
   perform_startup_clear();
+
+  const bool battery_ready = battery_begin();
+  ESP_LOGI(kTag, "battery management initialization=%s", battery_ready ? "ready" : "failed");
 
   g_touch_available = touch_init();
   touch_set_rotation(0);

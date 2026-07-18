@@ -25,7 +25,8 @@ constexpr Rect kSaveRect = {316, 20, 94, 42};
 constexpr Rect kLoadRect = {420, 20, 100, 42};
 constexpr Rect kSelectRect = {160, 842, 92, 30};
 constexpr Rect kStartRect = {288, 842, 92, 30};
-constexpr Rect kSettingsButtonRect = {370, 902, 150, 42};
+constexpr Rect kSettingsButtonRect = {390, 902, 130, 42};
+constexpr Rect kMainBatteryRect = {20, 902, 130, 42};
 // Use a much larger hit target than the visible frame. The old 140x42 target
 // was too close to the lower edge for reliable finger taps on the GT911.
 constexpr Rect kSettingsTouchRect = {320, 876, 220, 80};
@@ -224,12 +225,15 @@ void draw_settings_menu(uint8_t *framebuffer) {
   draw_centered_text(framebuffer, 650, "SELECT AN ITEM TO OPEN", 1);
 }
 
-const char *battery_state_text(const BatteryStatus &battery) {
+const char *battery_state_text(const PaperboyBatteryStatus &battery) {
   if (!battery.gauge_found && !battery.charger_found) {
     return "BATTERY HARDWARE NOT FOUND";
   }
   if (!battery.gauge_read_ok && !battery.charger_read_ok) {
     return "BATTERY READ ERROR";
+  }
+  if (battery.fault_present) {
+    return "CHARGER FAULT";
   }
   if (battery.charge_done) {
     return "FULL";
@@ -237,10 +241,81 @@ const char *battery_state_text(const BatteryStatus &battery) {
   if (battery.charging) {
     return "CHARGING";
   }
+  if (battery.usb_connected && !battery.charge_enabled) {
+    return "CHARGE DISABLED";
+  }
   if (battery.average_current_ma < -20) {
     return "DISCHARGING";
   }
   return battery.usb_connected ? "USB POWER" : "IDLE";
+}
+
+const char *main_battery_state_text(const PaperboyBatteryStatus *battery) {
+  if (battery == nullptr ||
+      (!battery->gauge_read_ok && !battery->charger_read_ok)) {
+    return "--";
+  }
+  if (battery->fault_present) {
+    return "FAULT";
+  }
+  if (battery->charge_done) {
+    return "FULL";
+  }
+  if (battery->charging) {
+    return "CHG";
+  }
+  if (battery->usb_connected && !battery->charge_enabled) {
+    return "OFF";
+  }
+  return battery->usb_connected ? "USB" : "BAT";
+}
+
+void draw_main_battery_indicator(
+    uint8_t *framebuffer, const PaperboyBatteryStatus *battery) {
+  mono_fill_rect(
+      framebuffer, kPitch, kWidth, kHeight,
+      kMainBatteryRect.x, kMainBatteryRect.y,
+      kMainBatteryRect.width, kMainBatteryRect.height, true);
+  mono_draw_frame(
+      framebuffer, kPitch, kWidth, kHeight,
+      kMainBatteryRect.x, kMainBatteryRect.y,
+      kMainBatteryRect.width, kMainBatteryRect.height, 2, false);
+
+  constexpr int kIconX = 30;
+  constexpr int kIconY = 912;
+  constexpr int kIconWidth = 46;
+  constexpr int kIconHeight = 22;
+  constexpr int kFillWidth = 38;
+  mono_draw_frame(
+      framebuffer, kPitch, kWidth, kHeight,
+      kIconX, kIconY, kIconWidth, kIconHeight, 2, false);
+  mono_fill_rect(
+      framebuffer, kPitch, kWidth, kHeight,
+      kIconX + kIconWidth, kIconY + 7, 5, 8, false);
+
+  const bool soc_available = battery != nullptr && battery->gauge_read_ok;
+  const uint16_t soc = !soc_available
+      ? 0U
+      : (battery->soc_percent > 100U ? 100U : battery->soc_percent);
+  const int fill_width = static_cast<int>((kFillWidth * soc + 99U) / 100U);
+  if (fill_width > 0) {
+    mono_fill_rect(
+        framebuffer, kPitch, kWidth, kHeight,
+        kIconX + 4, kIconY + 4, fill_width, kIconHeight - 8, false);
+  }
+
+  char percent[8];
+  if (soc_available) {
+    snprintf(percent, sizeof(percent), "%u%%", soc);
+  } else {
+    snprintf(percent, sizeof(percent), "--%%");
+  }
+  mono_draw_text(
+      framebuffer, kPitch, kWidth, kHeight,
+      92, 914, percent, 2, false);
+  mono_draw_text(
+      framebuffer, kPitch, kWidth, kHeight,
+      120, 919, main_battery_state_text(battery), 1, false);
 }
 
 void draw_value_row(uint8_t *framebuffer, int y, const char *label, const char *value) {
@@ -249,7 +324,8 @@ void draw_value_row(uint8_t *framebuffer, int y, const char *label, const char *
   mono_draw_line(framebuffer, kPitch, kWidth, kHeight, 44, y + 28, 496, y + 28, false);
 }
 
-void draw_battery_page(uint8_t *framebuffer, const BatteryStatus *battery) {
+void draw_battery_page(
+    uint8_t *framebuffer, const PaperboyBatteryStatus *battery) {
   if (battery == nullptr) {
     draw_centered_text(framebuffer, 300, "BATTERY DATA UNAVAILABLE", 2);
     draw_button_box(framebuffer, kRefreshRect, "REFRESH", false);
@@ -277,25 +353,48 @@ void draw_battery_page(uint8_t *framebuffer, const BatteryStatus *battery) {
       value, sizeof(value), "%u / %u mAh",
       battery->remaining_capacity_mah, battery->full_capacity_mah);
   draw_value_row(framebuffer, 434, "CAPACITY", value);
-  snprintf(value, sizeof(value), "%u%%", battery->health_percent);
-  draw_value_row(framebuffer, 486, "HEALTH", value);
-
+  char temperature[24];
   if (battery->temperature_dk == 0U) {
-    snprintf(value, sizeof(value), "--");
+    snprintf(temperature, sizeof(temperature), "--");
   } else {
     const int deci_c = static_cast<int>(battery->temperature_dk) - 2731;
-    snprintf(value, sizeof(value), "%d.%d C", deci_c / 10, abs(deci_c % 10));
+    snprintf(
+        temperature, sizeof(temperature),
+        "%d.%d C", deci_c / 10, abs(deci_c % 10));
   }
-  draw_value_row(framebuffer, 538, "TEMPERATURE", value);
-  snprintf(value, sizeof(value), "%u", battery->cycle_count);
-  draw_value_row(framebuffer, 590, "CYCLES", value);
-  draw_value_row(
-      framebuffer, 642, "BQ27220",
-      !battery->gauge_found ? "NOT FOUND" : (battery->gauge_read_ok ? "ONLINE" : "READ ERROR"));
-  draw_value_row(
-      framebuffer, 694, "BQ25896",
-      !battery->charger_found ? "NOT FOUND" : (battery->charger_read_ok ? "ONLINE" : "READ ERROR"));
-  draw_value_row(framebuffer, 746, "USB", battery->usb_connected ? "CONNECTED" : "DISCONNECTED");
+  snprintf(
+      value, sizeof(value), "%u%% / %s", battery->health_percent, temperature);
+  draw_value_row(framebuffer, 486, "HEALTH / TEMP", value);
+  snprintf(
+      value, sizeof(value), "%u mV / %u mA",
+      battery->vbus_voltage_mv, battery->configured_input_limit_ma);
+  draw_value_row(framebuffer, 538, "VBUS / INPUT", value);
+  snprintf(
+      value, sizeof(value), "%u / %u mA",
+      battery->configured_charge_current_ma, battery->charger_adc_current_ma);
+  draw_value_row(framebuffer, 590, "CHG SET / ADC", value);
+  snprintf(
+      value, sizeof(value), "%u / %u mV",
+      battery->configured_charge_voltage_mv, battery->system_voltage_mv);
+  draw_value_row(framebuffer, 642, "VREG / VSYS", value);
+  snprintf(
+      value, sizeof(value), "%u / %u mA",
+      battery->configured_precharge_current_ma,
+      battery->configured_termination_current_ma);
+  draw_value_row(framebuffer, 694, "PRE / TERM", value);
+  snprintf(
+      value, sizeof(value), "CHG %s / HIZ %s",
+      battery->charge_enabled ? "ON" : "OFF",
+      battery->hiz_enabled ? "ON" : "OFF");
+  draw_value_row(framebuffer, 746, "POWER PATH", value);
+
+  char hardware[80];
+  snprintf(
+      hardware, sizeof(hardware), "BQ27220 %s | BQ25896 %s | FAULT %s",
+      !battery->gauge_found ? "MISSING" : (battery->gauge_read_ok ? "OK" : "ERROR"),
+      !battery->charger_found ? "MISSING" : (battery->charger_read_ok ? "OK" : "ERROR"),
+      battery->fault_present ? "YES" : "NONE");
+  draw_centered_text(framebuffer, 792, hardware, 1);
   draw_button_box(framebuffer, kRefreshRect, "REFRESH", false);
 }
 
@@ -444,7 +543,8 @@ void paperboy_ui_draw_dynamic(
     uint8_t *framebuffer,
     uint8_t buttons,
     bool power_on,
-    bool save_available) {
+    bool save_available,
+    const PaperboyBatteryStatus *battery) {
   if (framebuffer == nullptr) {
     return;
   }
@@ -460,13 +560,14 @@ void paperboy_ui_draw_dynamic(
   draw_round_button(framebuffer, kButtonBX, kButtonBY, (buttons & GBEMU_INPUT_B) != 0U);
   draw_button_box(framebuffer, kSelectRect, "", (buttons & GBEMU_INPUT_SELECT) != 0U);
   draw_button_box(framebuffer, kStartRect, "", (buttons & GBEMU_INPUT_START) != 0U);
+  draw_main_battery_indicator(framebuffer, battery);
   draw_button_box(framebuffer, kSettingsButtonRect, "SETTING", false);
 }
 
 void paperboy_ui_draw_page(
     uint8_t *framebuffer,
     PaperboyPage page,
-    const BatteryStatus *battery,
+    const PaperboyBatteryStatus *battery,
     const char *firmware_version,
     const char *rom_title,
     bool touch_available) {
