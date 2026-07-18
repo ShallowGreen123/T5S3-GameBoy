@@ -3,6 +3,7 @@
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 .vscode/ipch
+.vscode
 src/rom/test_rom.h
 __pycache__/
 *.py[cod]

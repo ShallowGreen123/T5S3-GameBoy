@@ -1,35 +1,40 @@
 # T5S3-GameBoy
 
-基于 LilyGO T5S3-4.7-e-paper-PRO 的竖屏触摸 Game Boy（DMG）模拟器。项目使用
-Peanut-GB、GT911、BQ27220、BQ25896 和 1bpp 墨水屏实时刷新方案。
+[中文](README_CN.md) | **English**
 
-## 功能
+A portrait-mode touchscreen Game Boy (DMG) emulator based on the [LilyGO T5S3-4.7-e-paper-PRO](https://github.com/Xinyuan-LilyGO/T5S3-4.7-e-paper-PRO). Built with Peanut-GB, GT911, BQ27220, BQ25896, and a real-time 1bpp e-ink refresh scheme.
 
-- 480×432 Game Boy 画面，固定像素抖动转换为清晰的 1bpp 黑白输出。
-- 屏幕十字键、A/B、SELECT/START 多点触摸控制。
-- 内存快速存档和读档；断电或复位后存档会丢失。
-- 设置、Battery Status、SD Card 占位页面和 About System 页面。
-- BQ27220 电量计与 BQ25896 充电管理，主页面显示电量和充电状态。
-- BOOT 键执行白→黑→白清屏并重绘当前页面。
-- 主页面长按 PCA9535 实体按键 2 秒，清屏显示提示后安全关机。
+| ![](./docs/1.jpg) | ![](./docs/2.jpg) |
+| --- | --- |
 
-## 项目结构
+## Features
+
+- 480×432 Game Boy display, converted to crisp 1bpp black-and-white output via fixed dithering.
+- On-screen D-pad, A/B, SELECT/START multi-touch controls.
+- In-memory save states and load states; saves are lost on power-off or reset.
+- Settings, Battery Status, SD Card placeholder pages, and an About System page.
+- BQ27220 fuel gauge and BQ25896 charge management; battery level and charging status shown on the home screen.
+- `BOOT` button triggers a white→black→white screen clear and redraws the current page.
+- Long-press the `IO48` physical button for 2 seconds on the home screen to clear the display, show a prompt, and safely shut down.
+- Long-press `PWR` to power on.
+
+## Project Structure
 
 ```text
 T5S3-GameBoy/
-├─ src/                   主程序、显示、触摸和模拟器源码
-│  ├─ gbcore/             Peanut-GB 核心
-│  └─ rom/                自定义 ROM 说明及生成后的 test_rom.h
-├─ lib/                   BQ25896、BQ27220 和 I²C 兼容层
-├─ boards/                LilyGO T5S3 PlatformIO 板卡配置
-├─ tools/                 .gb ROM 转换工具
-├─ firmware/              发布固件
-└─ platformio.ini         唯一的项目构建配置
+├─ src/                   Main program, display, touch, and emulator source
+│  ├─ gbcore/             Peanut-GB core
+│  └─ rom/                Custom ROM notes and generated test_rom.h
+├─ lib/                   BQ25896, BQ27220, and I²C compatibility layer
+├─ boards/                LilyGO T5S3 PlatformIO board config
+├─ tools/                 .gb ROM conversion tool
+├─ firmware/              Release firmware
+└─ platformio.ini         The sole project build configuration
 ```
 
-## 编译与烧录
+## Build & Flash
 
-在项目根目录执行：
+Run these commands from the project root:
 
 ```powershell
 pio run
@@ -37,32 +42,43 @@ pio run -t upload --upload-port COM45
 pio device monitor -p COM45 -b 115200
 ```
 
-默认且唯一的 PlatformIO 环境名为 `T5S3-GameBoy`。
+The only PlatformIO environment name is `T5S3-GameBoy`.
 
-## 使用自己的游戏 ROM
+## Using Your Own Game ROM
 
-请只使用你有权运行和转换的 DMG 兼容 `.gb` 文件：
+Using `maxpirateeb.gb` as an example:
+
+1. Download the target game's `.gb` file from an authorized ROM site.
+2. Place the `.gb` file in the project's `ROMs/` folder.
+3. Run the following commands to flash it to the device (replace `COM45` with your port):
 
 ```powershell
-python tools/gb_rom_to_header.py "D:\ROMs\game.gb"
+python tools/gb_rom_to_header.py .\ROMs\maxpirateeb.gb
 pio run -t clean
 pio run -t upload --upload-port COM45
 ```
 
-工具默认生成 `src/rom/test_rom.h`。该文件存在时会替换内置演示 ROM；删除它并重新
-编译即可恢复内置 ROM。生成文件默认不提交到 Git，避免误提交受版权保护的数据。
+The tool generates `src/rom/test_rom.h` by default. When that file exists it replaces the built-in demo ROM; delete it and recompile to restore the built-in ROM. The generated file is excluded from Git by default to avoid accidentally committing copyright-protected data.
 
-当前不支持仅限 Game Boy Color 的 `.gbc` 游戏，也暂未输出声音。
+Game Boy Color-only `.gbc` games are not currently supported, and audio output is not yet implemented.
 
-## 充电参数
+Sites that host explicitly licensed homebrew games:
 
-充电方案与 T5S3-Reader 保持一致：
+- <https://hh.gbdev.io/search?typetag=game>
+- <https://itch.io/games/tag-gameboy>
+- <https://itch.io/jams/tag-gameboy>
 
-- 输入电流上限：1000 mA
-- 快充电流：512 mA
-- 预充/终止电流：64/64 mA
-- 满充电压：4208 mV
-- 最低系统电压：3300 mV
-- 电池模型容量：1500 mAh
+Choose `.gb` files marked as DMG, Original Game Boy, or Game Boy compatible. `GBC only` games will not run. "Old", "out-of-print", or "abandonware" does not mean legally downloadable.
 
-固件不会在 NTC、温度或安全计时故障期间强制恢复充电。
+## Charging Parameters
+
+Charging configuration matches the T5S3-Reader:
+
+- Input current limit: 1000 mA
+- Fast-charge current: 512 mA
+- Pre-charge / termination current: 64 / 64 mA
+- Charge voltage: 4208 mV
+- Minimum system voltage: 3300 mV
+- Battery model capacity: 1500 mAh
+
+The firmware will not force-resume charging during NTC, temperature, or safety timer faults.
