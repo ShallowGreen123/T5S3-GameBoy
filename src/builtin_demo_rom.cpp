@@ -146,7 +146,7 @@ void build_background_map() {
   map[(17U * 32U)] = 29U;
   map[(17U * 32U) + 19U] = 29U;
 
-  write_map_text(map, 3U, 6U, "PAPER BOY");
+  write_map_text(map, 3U, 4U, "T5S3 GAMEBOY");
   write_map_text(map, 6U, 6U, "EPD DEMO");
   write_map_text(map, 11U, 4U, "TOUCH READY");
   write_map_text(map, 14U, 5U, "HOME BREW");
@@ -163,7 +163,7 @@ void build_demo_rom() {
   g_demo_rom[0x0101] = 0x50;
   g_demo_rom[0x0102] = 0x01;
   memcpy(&g_demo_rom[0x0104], kNintendoLogo, sizeof(kNintendoLogo));
-  memcpy(&g_demo_rom[0x0134], "PAPERBOY DEMO", 13);
+  memcpy(&g_demo_rom[0x0134], "T5S3 GAMEBOY", 12);
 
   g_demo_rom[0x0143] = 0x00;
   g_demo_rom[0x0144] = 0x00;
@@ -209,5 +209,5 @@ size_t builtin_demo_rom_size() {
 }
 
 const char *builtin_demo_rom_name() {
-  return "Bundled PaperBoy homebrew title demo";
+  return "Bundled T5S3-GameBoy homebrew demo";
 }

@@ -426,7 +426,7 @@ void draw_about_page(
   draw_value_row(framebuffer, 540, "TOUCH", touch_available ? "GT911 ONLINE" : "NOT FOUND");
   draw_value_row(framebuffer, 600, "SOFTWARE", firmware_version == nullptr ? "UNKNOWN" : firmware_version);
   draw_value_row(framebuffer, 660, "GAME", rom_title == nullptr ? "UNKNOWN" : rom_title);
-  draw_centered_text(framebuffer, 770, "EPD PAPERBOY", 3);
+  draw_centered_text(framebuffer, 770, "T5S3 GAMEBOY", 3);
   draw_centered_text(framebuffer, 820, "OPEN SOURCE DEMO SYSTEM", 1);
 }
 
@@ -531,7 +531,7 @@ void paperboy_ui_draw_static(uint8_t *framebuffer) {
   mono_draw_line(framebuffer, kPitch, kWidth, kHeight, 16, 72, 524, 72, false);
   mono_draw_frame(framebuffer, kPitch, kWidth, kHeight, 24, 80, 496, 448, 4, false);
   mono_fill_rect(framebuffer, kPitch, kWidth, kHeight, 24, 536, 496, 34, false);
-  mono_draw_text(framebuffer, kPitch, kWidth, kHeight, 36, 546, "PAPER BOY S3", 2, true);
+  mono_draw_text(framebuffer, kPitch, kWidth, kHeight, 36, 546, "T5S3 GAMEBOY", 2, true);
 
   mono_draw_text(framebuffer, kPitch, kWidth, kHeight, 344, 770, "B", 2, false);
   mono_draw_text(framebuffer, kPitch, kWidth, kHeight, 428, 696, "A", 2, false);

@@ -1,10 +1,10 @@
-.pio
+.pio/
 .vscode/.browse.c_cpp.db*
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 .vscode/ipch
-examples/epd_gb_frame_probe/main/rom/test_rom.h
-examples/epd_gb_touch_probe/main/rom/test_rom.h
-examples/epd_paperboy/main/rom/test_rom.h
+src/rom/test_rom.h
+__pycache__/
+*.py[cod]
 other
-script/
+script

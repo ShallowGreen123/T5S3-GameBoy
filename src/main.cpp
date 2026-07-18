@@ -28,7 +28,7 @@
 
 namespace {
 
-constexpr const char *kTag = "paperboy";
+constexpr const char *kTag = "T5S3-GameBoy";
 constexpr const char *kFirmwareVersion = "video-v13-charge";
 constexpr uint8_t kMinSkippedFramesBetweenRenders = 1;
 constexpr uint8_t kPanelBufferCount = 2;
@@ -975,7 +975,7 @@ void setup() {
 
   const BaseType_t task_result = xTaskCreatePinnedToCore(
       run_console,
-      "paperboy_console",
+      "gameboy_console",
       14336,
       nullptr,
       2,
