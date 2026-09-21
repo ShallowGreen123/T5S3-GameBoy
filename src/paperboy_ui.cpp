@@ -1,10 +1,12 @@
 #include "paperboy_ui.h"
+#include "paperboy_landscape.h"
 
 #include <Arduino.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "mono_canvas.h"
+#include "night_light.h"
 
 namespace {
 
@@ -16,6 +18,15 @@ constexpr uint32_t kRomNavigationRepeatDelayMs = 500U;
 constexpr uint32_t kRomNavigationRepeatRateMs = 150U;
 constexpr uint32_t kRomNavigationActions =
     PAPERBOY_ACTION_ROM_PREVIOUS | PAPERBOY_ACTION_ROM_NEXT;
+// Local actions are handled by the UI. Battery-page light actions also
+// synthesize REFRESH so the existing console loop redraws the new level.
+constexpr uint32_t kLightOffAction = 1UL << 16;
+constexpr uint32_t kLightDownAction = 1UL << 17;
+constexpr uint32_t kLightUpAction = 1UL << 18;
+constexpr uint32_t kLightActions =
+    kLightOffAction | kLightDownAction | kLightUpAction;
+constexpr uint8_t kLightStepPercent = 1U;
+constexpr uint8_t kLightMaxPercent = 10U;
 
 struct Rect {
   int x;
@@ -34,13 +45,20 @@ constexpr Rect kMainBatteryRect = {20, 902, 130, 42};
 // Use a much larger hit target than the visible frame. The old 140x42 target
 // was too close to the lower edge for reliable finger taps on the GT911.
 constexpr Rect kSettingsTouchRect = {320, 876, 220, 80};
+// These occupy the right side of the existing black brand bar. They are
+// outside the Game Boy playfield and do not inject A/B/D-pad input.
+constexpr Rect kGameLightDownRect = {328, 534, 76, 40};
+constexpr Rect kGameLightUpRect = {432, 534, 76, 40};
 
 constexpr Rect kBackRect = {20, 20, 112, 44};
 constexpr Rect kHomeRect = {408, 20, 112, 44};
 constexpr Rect kBatteryRect = {30, 150, 480, 120};
 constexpr Rect kSdCardRect = {30, 290, 480, 120};
 constexpr Rect kAboutRect = {30, 430, 480, 120};
-constexpr Rect kRefreshRect = {170, 826, 200, 48};
+constexpr Rect kRefreshRect = {170, 856, 200, 40};
+constexpr Rect kLightOffRect = {30, 778, 146, 56};
+constexpr Rect kLightDownRect = {196, 778, 146, 56};
+constexpr Rect kLightUpRect = {362, 778, 146, 56};
 constexpr Rect kAudioEngineRect = {20, 158, 500, 52};
 constexpr Rect kRomPreviousRect = {20, 686, 156, 54};
 constexpr Rect kRomNextRect = {192, 686, 156, 54};
@@ -62,8 +80,9 @@ constexpr int kButtonBY = 720;
 constexpr int kButtonRadius = 40;
 
 uint32_t g_last_action_mask = 0;
-uint32_t g_last_action_ms[16] = {0};
+uint32_t g_last_action_ms[20] = {0};
 bool g_ignore_actions_until_release = false;
+bool g_ignore_buttons_until_release = false;
 uint32_t g_rom_navigation_repeat_action = 0;
 uint32_t g_rom_navigation_repeat_next_ms = 0;
 
@@ -88,6 +107,7 @@ bool point_in_circle(uint16_t x, uint16_t y, int center_x, int center_y, int rad
 }
 
 uint32_t current_action_mask(const touch_state_t *touch, PaperboyPage page) {
+  if (page == PaperboyPage::Game && paperboy_is_landscape()) return paperboy_landscape_actions(touch);
   uint32_t mask = 0;
   if (touch == nullptr) {
     return mask;
@@ -104,6 +124,7 @@ uint32_t current_action_mask(const touch_state_t *touch, PaperboyPage page) {
     const uint16_t x = touch->x[i];
     const uint16_t y = touch->y[i];
     if (page == PaperboyPage::Game) {
+      if (point_in_rect(x, y, Rect{24, 534, 250, 40})) mask |= PAPERBOY_ACTION_ROTATE;
       if (point_in_rect(x, y, kPowerRect)) {
         mask |= PAPERBOY_ACTION_POWER;
       }
@@ -115,6 +136,12 @@ uint32_t current_action_mask(const touch_state_t *touch, PaperboyPage page) {
       }
       if (point_in_rect(x, y, kSettingsTouchRect)) {
         mask |= PAPERBOY_ACTION_SETTINGS;
+      }
+      if (point_in_rect(x, y, kGameLightDownRect)) {
+        mask |= kLightDownAction;
+      }
+      if (point_in_rect(x, y, kGameLightUpRect)) {
+        mask |= kLightUpAction;
       }
       continue;
     }
@@ -138,6 +165,15 @@ uint32_t current_action_mask(const touch_state_t *touch, PaperboyPage page) {
     } else if (page == PaperboyPage::Battery) {
       if (point_in_rect(x, y, kRefreshRect)) {
         mask |= PAPERBOY_ACTION_REFRESH;
+      }
+      if (point_in_rect(x, y, kLightOffRect)) {
+        mask |= kLightOffAction;
+      }
+      if (point_in_rect(x, y, kLightDownRect)) {
+        mask |= kLightDownAction;
+      }
+      if (point_in_rect(x, y, kLightUpRect)) {
+        mask |= kLightUpAction;
       }
     } else if (page == PaperboyPage::SdCard) {
       if (point_in_rect(x, y, kAudioEngineRect)) {
@@ -269,10 +305,14 @@ void draw_menu_item(
 }
 
 void draw_settings_menu(uint8_t *framebuffer) {
-  draw_menu_item(framebuffer, kBatteryRect, "BATTERY STATUS", "POWER AND CHARGE DETAILS");
+  draw_menu_item(framebuffer, kBatteryRect, "BATTERY + LIGHT", "POWER AND BRIGHTNESS CONTROLS");
   draw_menu_item(framebuffer, kSdCardRect, "SD CARD", "ROM LIBRARY AND SAVE FILES");
   draw_menu_item(framebuffer, kAboutRect, "ABOUT SYSTEM", "DEVICE AND SOFTWARE INFO");
-  draw_centered_text(framebuffer, 650, "SELECT AN ITEM TO OPEN", 1);
+  const Rect options[] = {kBatteryRect, kSdCardRect, kAboutRect};
+  const Rect &focus = options[paperboy_ui_controller_selection()];
+  mono_draw_frame(framebuffer, kPitch, kWidth, kHeight,
+                  focus.x - 7, focus.y - 7, focus.width + 14, focus.height + 14, 3, false);
+  draw_centered_text(framebuffer, 650, "UP/DOWN: SELECT   A: OPEN   B: BACK", 1);
 }
 
 const char *battery_state_text(const PaperboyBatteryStatus &battery) {
@@ -357,10 +397,22 @@ void draw_value_row(uint8_t *framebuffer, int y, const char *label, const char *
   mono_draw_line(framebuffer, kPitch, kWidth, kHeight, 44, y + 28, 496, y + 28, false);
 }
 
+void draw_light_controls(uint8_t *framebuffer) {
+  const uint8_t level = night_light_brightness();
+  char title[40];
+  snprintf(title, sizeof(title), "NIGHT LIGHT %u%% (MAX 10%%)", static_cast<unsigned>(level));
+  draw_centered_text(framebuffer, 736, title, 2);
+  draw_button_box(framebuffer, kLightOffRect, "OFF", level == 0U);
+  draw_button_box(framebuffer, kLightDownRect, "DIM -", false);
+  draw_button_box(framebuffer, kLightUpRect, "BRIGHT +", false);
+}
+
 void draw_battery_page(
     uint8_t *framebuffer, const PaperboyBatteryStatus *battery) {
+  // Light controls remain accessible even when the battery gauge is missing.
   if (battery == nullptr) {
     draw_centered_text(framebuffer, 300, "BATTERY DATA UNAVAILABLE", 2);
+    draw_light_controls(framebuffer);
     draw_button_box(framebuffer, kRefreshRect, "REFRESH", false);
     return;
   }
@@ -410,24 +462,14 @@ void draw_battery_page(
       value, sizeof(value), "%u / %u mV",
       battery->configured_charge_voltage_mv, battery->system_voltage_mv);
   draw_value_row(framebuffer, 642, "VREG / VSYS", value);
-  snprintf(
-      value, sizeof(value), "%u / %u mA",
-      battery->configured_precharge_current_ma,
-      battery->configured_termination_current_ma);
-  draw_value_row(framebuffer, 694, "PRE / TERM", value);
-  snprintf(
-      value, sizeof(value), "CHG %s / HIZ %s",
-      battery->charge_enabled ? "ON" : "OFF",
-      battery->hiz_enabled ? "ON" : "OFF");
-  draw_value_row(framebuffer, 746, "POWER PATH", value);
-
   char hardware[80];
   snprintf(
       hardware, sizeof(hardware), "BQ27220 %s | BQ25896 %s | FAULT %s",
       !battery->gauge_found ? "MISSING" : (battery->gauge_read_ok ? "OK" : "ERROR"),
       !battery->charger_found ? "MISSING" : (battery->charger_read_ok ? "OK" : "ERROR"),
       battery->fault_present ? "YES" : "NONE");
-  draw_centered_text(framebuffer, 792, hardware, 1);
+  draw_centered_text(framebuffer, 698, hardware, 1);
+  draw_light_controls(framebuffer);
   draw_button_box(framebuffer, kRefreshRect, "REFRESH", false);
 }
 
@@ -530,6 +572,7 @@ void draw_about_page(
 }  // namespace
 
 void paperboy_ui_init() {
+  night_light_init();
   g_last_action_mask = 0;
   memset(g_last_action_ms, 0, sizeof(g_last_action_ms));
   g_ignore_actions_until_release = false;
@@ -537,11 +580,18 @@ void paperboy_ui_init() {
 }
 
 void paperboy_ui_on_page_changed() {
+  paperboy_ui_controller_page_changed();
   g_ignore_actions_until_release = true;
+  g_ignore_buttons_until_release = true;
   reset_rom_navigation_repeat();
 }
 
 uint8_t paperboy_ui_map_buttons(const touch_state_t *touch) {
+  if (g_ignore_buttons_until_release) {
+    if (touch && !touch->touched) g_ignore_buttons_until_release = false;
+    return 0;
+  }
+  if (paperboy_is_landscape()) return paperboy_landscape_buttons(touch);
   uint8_t buttons = 0;
   if (touch == nullptr || !touch->touched) {
     return buttons;
@@ -600,7 +650,14 @@ uint32_t paperboy_ui_map_actions(const touch_state_t *touch, PaperboyPage page) 
       PAPERBOY_ACTION_LOAD_LAST,
       PAPERBOY_ACTION_AUDIO_ENGINE,
       PAPERBOY_ACTION_SD_RESCAN,
+      kLightOffAction,
+      kLightDownAction,
+      kLightUpAction,
+      PAPERBOY_ACTION_ROTATE,
   };
+  static_assert(sizeof(kActionBits) / sizeof(kActionBits[0]) ==
+                    sizeof(g_last_action_ms) / sizeof(g_last_action_ms[0]),
+                "action debounce array must include all light actions");
   const uint32_t now = millis();
   const uint32_t raw_current = current_action_mask(touch, page);
   const uint32_t raw_navigation = raw_current & kRomNavigationActions;
@@ -616,7 +673,7 @@ uint32_t paperboy_ui_map_actions(const touch_state_t *touch, PaperboyPage page) 
   if (g_ignore_actions_until_release) {
     reset_rom_navigation_repeat();
     g_last_action_mask = current;
-    if (raw_current == 0U) {
+    if (!touch || !touch->touched) {
       g_ignore_actions_until_release = false;
       g_last_action_mask = 0U;
     }
@@ -644,7 +701,26 @@ uint32_t paperboy_ui_map_actions(const touch_state_t *touch, PaperboyPage page) 
   }
 
   g_last_action_mask = current;
-  return fired;
+  const uint32_t light_action = fired & kLightActions;
+  if (light_action != 0U) {
+    const uint8_t previous = night_light_brightness();
+    uint8_t next = previous;
+    if ((light_action & kLightOffAction) != 0U) {
+      next = 0U;
+    } else if ((light_action & kLightUpAction) != 0U) {
+      next = previous >= (kLightMaxPercent - kLightStepPercent)
+          ? kLightMaxPercent : static_cast<uint8_t>(previous + kLightStepPercent);
+    } else if ((light_action & kLightDownAction) != 0U) {
+      next = previous < kLightStepPercent
+          ? 0U : static_cast<uint8_t>(previous - kLightStepPercent);
+    }
+    (void)night_light_set_brightness(next);
+    // The existing Battery-page REFRESH handler invalidates the scene.
+    if (page == PaperboyPage::Battery) {
+      fired |= PAPERBOY_ACTION_REFRESH;
+    }
+  }
+  return fired & ~kLightActions;
 }
 
 void paperboy_ui_draw_static(
@@ -659,7 +735,10 @@ void paperboy_ui_draw_static(
   mono_draw_line(framebuffer, kPitch, kWidth, kHeight, 16, 72, 524, 72, false);
   mono_draw_frame(framebuffer, kPitch, kWidth, kHeight, 24, 80, 496, 448, 4, false);
   mono_fill_rect(framebuffer, kPitch, kWidth, kHeight, 24, 536, 496, 34, false);
-  mono_draw_text(framebuffer, kPitch, kWidth, kHeight, 36, 546, "T5S3 GAMEBOY", 2, true);
+  mono_draw_text(framebuffer, kPitch, kWidth, kHeight, 36, 546, "ROTATE SCREEN", 2, true);
+  mono_draw_text(framebuffer, kPitch, kWidth, kHeight, 286, 547, "LIGHT", 1, true);
+  mono_draw_text(framebuffer, kPitch, kWidth, kHeight, 361, 546, "-", 2, true);
+  mono_draw_text(framebuffer, kPitch, kWidth, kHeight, 466, 546, "+", 2, true);
 
   mono_draw_text(framebuffer, kPitch, kWidth, kHeight, 344, 770, "B", 2, false);
   mono_draw_text(framebuffer, kPitch, kWidth, kHeight, 428, 696, "A", 2, false);
@@ -729,7 +808,7 @@ void paperboy_ui_draw_page(
       draw_settings_menu(framebuffer);
       break;
     case PaperboyPage::Battery:
-      draw_settings_header(framebuffer, "BATTERY STATUS");
+      draw_settings_header(framebuffer, "BATTERY + LIGHT");
       draw_battery_page(framebuffer, battery);
       break;
     case PaperboyPage::SdCard:

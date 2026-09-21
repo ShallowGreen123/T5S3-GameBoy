@@ -16,9 +16,12 @@
 #include "epd_video.h"
 #include "gbemu.h"
 #include "mono_canvas.h"
+#include "night_light.h"
+#include "snes_mini_controller.h"
 #include "paperboy_config.h"
 #include "paperboy_storage.h"
 #include "paperboy_ui.h"
+#include "paperboy_landscape.h"
 #include "pca9535_min.h"
 #include "t5s3_epd_pins.h"
 #include "touch_gt911.h"
@@ -51,8 +54,6 @@ constexpr size_t kScreenBytes =
     static_cast<size_t>(kPanelPitch) * t5s3_epd::kActiveHeight;
 constexpr size_t kPortraitBytes =
     static_cast<size_t>(PAPERBOY_LOGICAL_PITCH) * PAPERBOY_LOGICAL_HEIGHT;
-constexpr uint16_t kDynamicDirtyY = 20;
-constexpr uint16_t kDynamicDirtyHeight = 500;
 constexpr uint16_t kGameDirtyY =
     PAPERBOY_LOGICAL_WIDTH - PAPERBOY_GAME_X - GBEMU_FRAME_WIDTH;
 constexpr uint16_t kGameDirtyHeight = GBEMU_FRAME_WIDTH;
@@ -460,6 +461,7 @@ void rotate_game_to_panel(const uint8_t *game, uint8_t *panel) {
     return;
   }
 
+  if (paperboy_is_landscape()) { paperboy_landscape_game(game, panel); return; }
   const size_t dest_byte_x = PAPERBOY_GAME_Y / 8U;
   for (uint16_t panel_y = kGameDirtyY;
        panel_y < (kGameDirtyY + kGameDirtyHeight);
@@ -530,6 +532,11 @@ void compose_scene(
     return;
   }
 
+  if (page == PaperboyPage::Game && paperboy_is_landscape()) {
+    paperboy_landscape_draw(g_scene, framebuffer, g_game_frame, buttons, power_on,
+        g_memory_quicksave_valid || g_current_disk_snapshot_available, battery, visible_notice());
+    return;
+  }
   if (page == PaperboyPage::Game) {
     memcpy(g_scene, g_background, kPortraitBytes);
     if (power_on) {
@@ -1242,6 +1249,7 @@ bool rescan_storage() {
 }
 
 void on_shutdown() {
+  night_light_shutdown();
   epd_video_shutdown();
 }
 
@@ -1334,6 +1342,7 @@ void present_shutdown_page() {
     ESP_LOGW(kTag, "dirty cartridge save could not be written before shutdown");
   }
   present_shutdown_page();
+  night_light_shutdown();
   audio_deinit();
   paperboy_storage_end();
   epd_video_shutdown();
@@ -1478,9 +1487,32 @@ void run_console(void *unused) {
       }
     }
 
-    const uint8_t buttons =
-        (touch_ok && page == PaperboyPage::Game) ? paperboy_ui_map_buttons(&touch) : 0U;
-    const uint32_t actions = touch_ok ? paperboy_ui_map_actions(&touch, page) : 0U;
+    // Poll on every page so held shoulders cannot become a new press on return.
+    const uint8_t controller_buttons = snes_mini_controller_buttons();
+    const uint8_t controller_actions = snes_mini_controller_take_actions();
+    const uint32_t menu_actions = paperboy_ui_map_controller(
+        snes_mini_controller_navigation_buttons(), page, now_ms);
+    uint8_t buttons = page == PaperboyPage::Game
+        ? ((touch_ok ? paperboy_ui_map_buttons(&touch) : 0U) | (paperboy_ui_controller_ready() ? controller_buttons : 0U))
+        : 0U;
+    uint32_t actions = touch_ok ? paperboy_ui_map_actions(&touch, page) : 0U;
+    actions |= menu_actions;
+    if (menu_actions != 0U) full_scene_syncs = kPanelBufferCount;
+    if (controller_actions & SNES_ACTION_SETTINGS) {
+      actions = PAPERBOY_ACTION_SETTINGS;
+    }
+    if (page == PaperboyPage::Game) {
+      if (controller_actions & SNES_ACTION_ROTATE) actions = PAPERBOY_ACTION_ROTATE;
+      if (controller_actions & SNES_ACTION_SAVE) actions |= PAPERBOY_ACTION_SAVE;
+      if (controller_actions & SNES_ACTION_LOAD) actions |= PAPERBOY_ACTION_LOAD;
+    }
+    if (controller_actions & (SNES_ACTION_DIM | SNES_ACTION_BRIGHTEN)) {
+      const uint8_t level = night_light_brightness();
+      const uint8_t target = (controller_actions & SNES_ACTION_BRIGHTEN)
+          ? static_cast<uint8_t>(level + 1U)
+          : static_cast<uint8_t>(level > 0U ? level - 1U : 0U);
+      (void)night_light_set_brightness(target);
+    }
     if (buttons != last_buttons) {
       full_scene_syncs = kPanelBufferCount;
     }
@@ -1532,6 +1564,18 @@ void run_console(void *unused) {
           touch_ok ? touch.points : 0U,
           (touch_ok && touch.points > 0U) ? touch.x[0] : 0U,
           (touch_ok && touch.points > 0U) ? touch.y[0] : 0U);
+    }
+
+    if ((actions & PAPERBOY_ACTION_ROTATE) != 0U) {
+      paperboy_orientation_cycle();
+      paperboy_ui_on_page_changed();
+      full_scene_syncs = kPanelBufferCount;
+      skipped_since_render = 0U;
+      reset_game_frame_pacer(game_frame_pacer);
+      ESP_LOGI(kTag, "screen orientation=%u", static_cast<unsigned>(paperboy_orientation()));
+      // Discard input collected against the old layout on this frame.
+      last_buttons = 0;
+      continue;
     }
 
     if ((actions & PAPERBOY_ACTION_POWER) != 0U) {
@@ -1650,7 +1694,7 @@ void run_console(void *unused) {
       }
       full_scene_syncs = kPanelBufferCount;
     }
-    if ((actions & PAPERBOY_ACTION_SETTINGS) != 0U && page == PaperboyPage::Game) {
+    if ((actions & PAPERBOY_ACTION_SETTINGS) != 0U) {
       next_page = PaperboyPage::Settings;
     }
     if ((actions & PAPERBOY_ACTION_BACK) != 0U) {
@@ -1682,6 +1726,7 @@ void run_console(void *unused) {
       }
       ESP_LOGI(kTag, "page %u -> %u", static_cast<unsigned>(page), static_cast<unsigned>(next_page));
       page = next_page;
+      buttons = 0U;  // Do not inject the menu activation/back key into gameplay.
       audio_set_paused(page != PaperboyPage::Game || !power_on);
       paperboy_ui_on_page_changed();
       full_scene_syncs = kPanelBufferCount;
@@ -1773,8 +1818,8 @@ void run_console(void *unused) {
         add_sample(draw_timing, frame_stats.draw_us);
         const int64_t flip_started = esp_timer_get_time();
         const bool submitted = epd_video_submit(
-            full_scene ? kDynamicDirtyY : kGameDirtyY,
-            full_scene ? kDynamicDirtyHeight : kGameDirtyHeight);
+            full_scene ? 0 : (paperboy_is_landscape() ? PAPERBOY_LANDSCAPE_GAME_Y : kGameDirtyY),
+            full_scene ? t5s3_epd::kActiveHeight : (paperboy_is_landscape() ? GBEMU_FRAME_HEIGHT : kGameDirtyHeight));
         add_sample(flip_timing, static_cast<uint32_t>(esp_timer_get_time() - flip_started));
         if (submitted) {
           ++rendered_frames;
@@ -1793,7 +1838,7 @@ void run_console(void *unused) {
     } else if (page == PaperboyPage::Game && full_scene_syncs > 0U && epd_video_can_submit()) {
       uint8_t *backbuffer = epd_video_get_backbuffer();
       compose_scene(backbuffer, buttons, power_on, page, &battery);
-      if (epd_video_submit(kDynamicDirtyY, kDynamicDirtyHeight)) {
+      if (epd_video_submit(0, t5s3_epd::kActiveHeight)) {
         --full_scene_syncs;
       }
     } else if (page != PaperboyPage::Game &&
@@ -1878,6 +1923,7 @@ void setup() {
   }
 
   perform_startup_clear();
+  night_light_init();
 
   const bool battery_ready = battery_begin();
   ESP_LOGI(kTag, "battery management initialization=%s", battery_ready ? "ready" : "failed");

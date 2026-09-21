@@ -1,0 +1,130 @@
+name: Cut GameBoy release
+
+on:
+  push:
+    branches: [master]
+    tags:
+      - 'v[0-9]*'
+    # Paths only filter master pushes; GitHub does not apply path filters to tags.
+    paths: ['.github/release-request.json']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Version matching platformio.ini, e.g. v1.2.0'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: cut-gameboy-release
+  cancel-in-progress: false
+
+jobs:
+  request:
+    name: Validate release request
+    runs-on: ubuntu-latest
+    outputs:
+      publish: ${{ steps.request.outputs.publish }}
+      tag: ${{ steps.request.outputs.tag }}
+      version: ${{ steps.request.outputs.version }}
+    steps:
+      - name: Check out repository and tags
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Validate requested version and master ancestry
+        id: request
+        run: python3 scripts/resolve_release_request.py
+
+  release:
+    needs: request
+    if: ${{ needs.request.outputs.publish == 'true' }}
+    name: Build and publish individual GameBoy binaries
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source and tags
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Cache PlatformIO packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio/.cache
+            ~/.platformio/packages
+            ~/.platformio/platforms
+          key: ${{ runner.os }}-gameboy-pio-${{ hashFiles('platformio.ini', 'boards/*.json') }}
+          restore-keys: |
+            ${{ runner.os }}-gameboy-pio-
+
+      - name: Install PlatformIO
+        run: python -m pip install platformio==6.1.19
+
+      - name: Build GameBoy firmware
+        run: pio run -e T5S3-GameBoy
+
+      # Preserve the exact built binaries before any later build can mutate .pio.
+      - name: Validate and preserve release binaries
+        run: |
+          python scripts/stage_firmware.py
+          (cd dist && sha256sum -c SHA256SUMS)
+
+      # Actions upload-artifact always downloads as a ZIP. A tagged build instead
+      # publishes the four ORIGINAL files individually as GitHub Release assets.
+      - name: Create tag if needed and publish individual release files
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.request.outputs.tag }}
+          VERSION: ${{ needs.request.outputs.version }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "::error::Release $TAG already exists; refusing to replace its binaries"
+            exit 1
+          fi
+
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            TARGET="$(git rev-list -n 1 "$TAG")"
+            HEAD_SHA="$(git rev-parse HEAD)"
+            if [[ "$TARGET" != "$HEAD_SHA" ]]; then
+              echo "::error::Tag $TAG belongs to a different commit ($TARGET)"
+              exit 1
+            fi
+            echo "Publishing from existing tag $TAG"
+          else
+            if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+              echo "::error::Triggered tag $TAG was not found in checked-out refs"
+              exit 1
+            fi
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git tag -a "$TAG" -m "T5S3-GameBoy $TAG"
+            git push origin "refs/tags/$TAG"
+          fi
+
+          assets=(
+            "dist/T5S3-GameBoy-${TAG}-app.bin"
+            "dist/T5S3-GameBoy-${TAG}-merged.bin"
+            "dist/T5S3-GameBoy-${TAG}.elf"
+            "dist/SHA256SUMS"
+          )
+          for asset in "${assets[@]}"; do
+            if [[ ! -s "$asset" ]]; then
+              echo "::error::Required release asset missing or empty: $asset"
+              exit 1
+            fi
+          done
+
+          gh release create "$TAG" "${assets[@]}" \
+            --verify-tag \
+            --title "T5S3-GameBoy $VERSION" \
+            --notes "Four separate download files (not an artifact ZIP) for LilyGO T5S3-4.7 E-Paper Pro. T5S3-GameBoy-${TAG}-app.bin is the application-only image (flash at 0x10000); T5S3-GameBoy-${TAG}-merged.bin is the complete USB image (flash at 0x0). The .elf is for debugging, not flashing. SHA256SUMS contains integrity hashes. Do not flash the application-only image at 0x0 or use the merged image for app-only updates."

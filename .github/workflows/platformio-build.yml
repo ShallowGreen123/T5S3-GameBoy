@@ -1,0 +1,74 @@
+name: GameBoy PlatformIO Build
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gameboy-build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  firmware:
+    name: Build T5S3 E-Paper Pro firmware
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Test release-tag validation
+        run: python -m unittest discover -s tests -p 'test_release_request.py' -v
+
+      - name: Test landscape rendering and touch mapping
+        run: |
+          c++ -std=c++11 -Wall -Wextra -Werror -fsanitize=address,undefined -Isrc \
+            src/paperboy_orientation.cpp src/paperboy_landscape.cpp src/mono_canvas.cpp \
+            tests/landscape_test.cpp -o /tmp/landscape-test
+          /tmp/landscape-test
+
+      - name: Test controller shortcuts and menu navigation
+        run: |
+          c++ -std=c++11 -Wall -Wextra -Werror -Wno-unused-parameter -fsanitize=address,undefined \
+            -Itests/controller_stubs -Isrc src/snes_mini_controller.cpp \
+            src/paperboy_controller_navigation.cpp tests/controller_test.cpp -o /tmp/controller-test
+          /tmp/controller-test
+
+      - name: Cache PlatformIO packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio/.cache
+            ~/.platformio/packages
+            ~/.platformio/platforms
+          key: ${{ runner.os }}-gameboy-pio-${{ hashFiles('platformio.ini', 'boards/*.json') }}
+          restore-keys: |
+            ${{ runner.os }}-gameboy-pio-
+
+      - name: Install PlatformIO
+        run: python -m pip install platformio==6.1.19
+
+      - name: Build firmware and merged flash image
+        run: pio run -e T5S3-GameBoy
+
+      - name: Validate and stage binaries
+        run: |
+          python scripts/stage_firmware.py
+          (cd dist && sha256sum -c SHA256SUMS)
+
+      - name: Upload downloadable binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: gameboy-t5s3-${{ github.sha }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30

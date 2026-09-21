@@ -23,6 +23,7 @@ static constexpr uint8_t kSdCs = 12;
 static constexpr uint8_t kTouchInt = 3;
 static constexpr uint8_t kTouchRst = 9;
 static constexpr uint8_t kBootButton = 0;
+static constexpr uint8_t kBacklightEnable = 11;
 static constexpr uint8_t kPca9535Int = 38;
 static constexpr uint8_t kLoraCs = 46;
 

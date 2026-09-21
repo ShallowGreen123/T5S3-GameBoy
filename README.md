@@ -137,3 +137,27 @@ The charging configuration matches the T5S3-Reader:
 - Battery-model capacity: 1500 mAh
 
 The firmware does not force charging to resume during NTC, temperature, or safety-timer faults.
+
+
+## Landscape controls
+
+Tap **ROTATE SCREEN** below the portrait game display to cycle through landscape,
+reverse landscape, and portrait. Landscape keeps the original 480 x 432 game
+image centered on the 960 x 540 panel, with the D-pad on the left and A/B on the
+right. Select, Start, Save, Load, power, light controls and Settings remain
+available. Settings, battery, SD browser and About retain their portrait layout;
+returning to the game restores the selected orientation. Rotation takes effect
+without restarting the emulator. Lift your fingers after rotating before using
+the new controls. Orientation starts in portrait on boot.
+
+### Automatic orientation hardware
+
+LilyGO's H752-01 Pro and Pro Lite hardware inventory and schematic do not list
+an onboard accelerometer. The bundled generic SensorLib includes accelerometer
+drivers for other boards; their presence is not evidence of a fitted sensor.
+In particular, address 0x6B on this board is the BQ25896 charger, not a QMI8658.
+This implementation therefore provides manual rotation only. Automatic rotation
+requires identification of an attached accelerometer (model, address, and axis
+mounting) or a different board revision before a driver can safely be added.
+
+Hardware reference: https://github.com/Xinyuan-LilyGO/T5S3-4.7-e-paper-PRO/tree/H752-01
